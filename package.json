@@ -1,0 +1,14 @@
+{
+  "name": "fmp-provider",
+  "version": "1.0.0",
+  "description": "FMP — FreeModels Proxies: OpenAI-compatible + Anthropic-compatible provider over freemodels.pro worker, with anti-truncation buffer+retry streaming",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "test": "node --test test/"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "license": "MIT"
+}

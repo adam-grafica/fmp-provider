@@ -1,0 +1,23 @@
+[Unit]
+Description=FMP FreeModels Provider OpenAI+Anthropic (loopback :2089)
+After=network-online.target
+Wants=network-online.target
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+WorkingDirectory=/home/adamcloud/platform/gateways/fmp-provider
+Environment=HOME=/home/adamcloud
+Environment=PORT=2089
+Environment=HOST=127.0.0.1
+Environment=FMP_MAX_RETRIES=3
+ExecStart=/usr/bin/node /home/adamcloud/platform/gateways/fmp-provider/server.js
+Restart=always
+RestartSec=3
+KillSignal=SIGTERM
+TimeoutStopSec=10
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=default.target
