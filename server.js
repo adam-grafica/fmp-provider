@@ -637,19 +637,21 @@ async function handleChatCompletions(req, res, body) {
       chunk = await readWorkerSSELive(upstream, async (piece) => {
         if (closed || diverged) return;
         fresh += piece;
-        const merged = dedupeAppend(emitted, fresh);
-        if (!merged.startsWith(emitted)) { diverged = true; return; }
-        const novel = merged.slice(emitted.length);
-        if (novel) {
-          const before = emitted.length;
-          emitNovel(novel);
-          fresh = fresh.slice(emitted.length - before) || fresh;
-          if (cappedHit) { diverged = true; complete = true; }
-        }
+        // Intra-intento: el worker SIEMPRE continúa (nunca reemite).
+        // Emitir directo sin dedupe: el merge solo aplica ENTRE intentos.
+        // (dedupeAppend regla 3 devolvía "el más largo" y rompía el
+        // prefijo cuando una pieza corta llegaba tras texto emitido.)
+        emitNovel(fresh);
+        fresh = "";
+        if (cappedHit) { diverged = true; complete = true; }
       }, ctrl.signal);
       if (diverged) {
-        stats.truncatedUpstream++;
-        trace(`${logTag} LIVE DIVERGED emitted=${emitted.length} -> close honest`);
+        if (cappedHit) {
+          trace(`${logTag} LIVE CAPPED emitted=${emitted.length} -> close length`);
+        } else {
+          stats.truncatedUpstream++;
+          trace(`${logTag} LIVE DIVERGED emitted=${emitted.length} -> close honest`);
+        }
         break;
       }
     } catch (e) {
@@ -1247,19 +1249,18 @@ async function handleMessages(req, res, body) {
       const chunk = await readWorkerSSELive(upstream, async (piece) => {
         if (closed || diverged) return;
         fresh += piece;
-        const merged = dedupeAppend(emitted, fresh);
-        if (!merged.startsWith(emitted)) { diverged = true; return; }
-        const novel = merged.slice(emitted.length);
-        if (novel) {
-          const before = emitted.length;
-          emitAnt(novel);
-          fresh = fresh.slice(emitted.length - before) || fresh;
-          if (cappedHit) { diverged = true; complete = true; }
-        }
+        // Intra-intento: emisión directa, igual que OAI (ver nota arriba).
+        emitAnt(fresh);
+        fresh = "";
+        if (cappedHit) { diverged = true; complete = true; }
       }, ctrl.signal);
       if (diverged) {
-        stats.truncatedUpstream++;
-        trace(`${logTag} LIVE DIVERGED emitted=${emitted.length} -> close honest`);
+        if (cappedHit) {
+          trace(`${logTag} LIVE CAPPED emitted=${emitted.length} -> close length`);
+        } else {
+          stats.truncatedUpstream++;
+          trace(`${logTag} LIVE DIVERGED emitted=${emitted.length} -> close honest`);
+        }
         break;
       }
       if (ctrl.signal.aborted || closed) break;
