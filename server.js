@@ -1,4 +1,4 @@
-// FMP — FreeModels Provider v1.0.0
+// FMP — FreeModels Provider v1.2.0
 // Traductor OpenAI-compatible + Anthropic-compatible hacia freemodels.pro.
 // Sin dependencias. Loopback-only por defecto (127.0.0.1:2089).
 //
@@ -17,6 +17,7 @@
 //   GET  /v1/models | /models
 //   POST /v1/chat/completions (OpenAI, stream y no-stream)
 //   POST /v1/messages         (Anthropic, stream y no-stream)
+//   POST /v1/responses        (Responses API p/Codex, stream y no-stream)
 "use strict";
 
 const http = require("node:http");
@@ -315,7 +316,7 @@ function handleHealth(res) {
   sendJson(res, 200, {
     ok: true,
     service: "fmp-provider",
-    version: "1.0.0",
+    version: "1.2.0",
     upstream: UPSTREAM,
     models: MODELS.map((m) => m.id),
     uptime_s: Math.floor((Date.now() - startedAt) / 1000),
@@ -424,6 +425,342 @@ async function handleChatCompletions(req, res, body) {
   res.end();
 }
 
+// Responses API (Codex) -> worker. Acepta `input` string, array de
+// items {role, content} o messages clásico. Reutiliza pipeline
+// anti-truncamiento + fallback JSON.
+// Items Responses -> worker. Incluye function_call / function_call_output
+// para rondas agénticas (Codex): el modelo ve qué llamó y qué devolvió.
+function itemTextOfOutput(output) {
+  if (typeof output === "string") return output;
+  if (Array.isArray(output)) {
+    return output.map((p) => {
+      if (typeof p === "string") return p;
+      if (p && typeof p === "object") {
+        if (typeof p.text === "string") return p.text;
+        if (typeof p.output_text === "string") return p.output_text;
+        return JSON.stringify(p).slice(0, 4000);
+      }
+      return "";
+    }).join("\n");
+  }
+  return output == null ? "" : String(output);
+}
+
+function toWorkerMessagesResp(input) {
+  if (typeof input === "string" && input) return [{ role: "user", content: input }];
+  if (Array.isArray(input)) {
+    const out = [];
+    for (const m of input) {
+      if (!m || typeof m !== "object") continue;
+      // function_call: el asistente pidió ejecutar una tool.
+      if (m.type === "function_call") {
+        out.push({ role: "assistant", content: `[llamada a herramienta ${m.name || "tool"}] ${m.arguments || m.call_id || ""}`.trim() });
+        continue;
+      }
+      // function_call_output: resultado de la ejecución (Codex lo ejecuta local).
+      if (m.type === "function_call_output") {
+        out.push({ role: "user", content: `[resultado de herramienta]\n${itemTextOfOutput(m.output)}` });
+        continue;
+      }
+      // Item Responses: {type:'message', role, content:[{type:'input_text',text}]}
+      const role = m.role === "assistant" || m.role === "system" ? m.role : "user";
+      const c = m.content;
+      let text = "";
+      if (typeof c === "string") text = c;
+      else if (Array.isArray(c)) {
+        text = c.map((p) => {
+          if (typeof p === "string") return p;
+          if (p && typeof p === "object") {
+            if (typeof p.text === "string") return p.text;
+            if (typeof p.input_text === "string") return p.input_text;
+            return "";
+          }
+          return "";
+        }).join("");
+      }
+      if (text) out.push({ role, content: text });
+    }
+    return out;
+  }
+  return [];
+}
+
+// Extrae llamada a herramienta del texto del worker.
+// Protocolo: el worker emite bloque
+//   EXEC:::<tool> ARGS <json>
+// y el puente lo convierte a function_call nativo.
+function parseToolCall(text, availTools) {
+  if (!text || !Array.isArray(availTools) || !availTools.length) return null;
+  const i = text.indexOf("EXEC:::");
+  if (i < 0) return null;
+  const rest = text.slice(i + 7).trim().split("\n")[0].trim();
+  const m = rest.match(/^([A-Za-z0-9_.-]+)\s+ARGS\s+(\{[\s\S]*\})\s*$/);
+  if (!m) return null;
+  const [, name, argsJson] = m;
+  const tool = availTools.find((t) => t.name === name);
+  if (!tool) return null;
+  let args = argsJson;
+  try { JSON.parse(argsJson); } catch { return null; }
+  const t = text.slice(0, i).trim();
+  return { name, args, prefixText: t };
+}
+
+// Fallback agéntico: si el worker no emitió EXEC::: pero el texto trae
+// un bloque shell (```bash ... ```), convertir el primero a exec_command.
+// Codex pide aprobación al usuario antes de ejecutar, no hay ejecución ciega.
+function extractShellBlock(text) {
+  if (!text) return null;
+  const m = text.match(/```(?:bash|sh|shell|zsh|cmd|powershell|console|terminal)?\s*\n([\s\S]*?)```/);
+  if (!m) return null;
+  const cmd = m[1].trim();
+  if (!cmd || cmd.length > 2000 || cmd.includes("\n\n\n")) return null;
+  // Evitar bloques que son claramente ilustrativos múltiples: solo el primero.
+  return cmd;
+}
+
+function toolDefsForWorker(tools) {
+  return (tools || [])
+    .filter((t) => t && t.type === "function" && t.name)
+    .map((t) => ({ name: t.name, description: String(t.description || "").slice(0, 400), params: t.parameters || {} }))
+    .slice(0, 25);
+}
+
+function agentSystemPrompt(tools) {
+  const defs = toolDefsForWorker(tools);
+  if (!defs.length) return "";
+  const lines = defs.map((d) => `- ${d.name}: ${d.description} params=${JSON.stringify(d.params).slice(0, 800)}`);
+  return [
+    "Eres un agente con herramientas. PUEDES y DEBES ejecutar comandos cuando el usuario lo pida.",
+    "Para actuar, responde PRIMERO un texto breve y LUEGO en línea propia el bloque:",
+    "EXEC:::<nombre_herramienta> ARGS <json con los parámetros>",
+    "Usa SOLO estas herramientas:",
+    ...lines,
+    "Para comandos shell usa exec_command con {\"cmd\": \"...\"}. Si no necesitas herramientas, responde normal sin bloque EXEC.",
+  ].join("\n");
+}
+
+async function resolveResponsesText(body, workerMessages, model, logTag) {
+  const thinking = !!body.thinking;
+  let result;
+  try {
+    result = await fetchCompleteText({ messages: workerMessages, modelId: model, thinking, deepSearch: false, signal: null, logTag });
+  } catch (e) {
+    stats.errors++;
+    throw e;
+  }
+  let status = result.complete ? "completed" : "incomplete";
+  if (!result.complete) {
+    try {
+      trace(`${logTag} FALLBACK-JSON charsSoFar=${result.text.length}`);
+      const ju = await callUpstream({ messages: workerMessages, modelId: model, stream: false, thinking, deepSearch: false, signal: null });
+      const jtext = await readWorkerJson(ju);
+      if (jtext.length >= result.text.length && jtext.length > 0) {
+        result = { text: jtext, attempts: result.attempts + 1, complete: true, aborted: false };
+        status = "completed";
+        trace(`${logTag} FALLBACK-OK chars=${jtext.length}`);
+      } else {
+        trace(`${logTag} FALLBACK-SHORTER json=${jtext.length} keep=${result.text.length}`);
+      }
+    } catch (e) {
+      trace(`${logTag} FALLBACK-FAIL err=${e.message}`);
+    }
+  }
+  return { result, status };
+}
+
+async function handleResponses(req, res, body) {
+  stats.requests++;
+  try {
+    const keys = Object.keys(body || {});
+    const nTools = Array.isArray(body.tools) ? body.tools.length : 0;
+    const nInput = Array.isArray(body.input) ? body.input.length : (typeof body.input);
+    trace(`RSP-REQ keys=${keys.join(",")} tools=${nTools} input=${nInput} stream=${body.stream} tool_choice=${JSON.stringify(body.tool_choice || null).slice(0, 80)}`);
+    try {
+      const tn = (body.tools || []).map((t) => t.name || t.type).slice(0, 25);
+      trace(`RSP-TOOLS ${JSON.stringify(tn)}`);
+      const it = (body.input || []).map((m) => m.type || "?").slice(0, 10);
+      trace(`RSP-INPUT-TYPES ${JSON.stringify(it)}`);
+    } catch {}
+  } catch {}
+  const model = stripPrefix(body.model);
+  if (!MODEL_IDS.has(model)) {
+    return sendJson(res, 404, {
+      error: { message: `model '${body.model}' not found. Valid: ${[...MODEL_IDS].join(", ")}`, type: "invalid_request_error", code: "model_not_found" },
+    });
+  }
+  let workerMessages = toWorkerMessagesResp(body.input);
+  if (!workerMessages.length && Array.isArray(body.messages)) workerMessages = toWorkerMessagesOA(body.messages);
+  if (typeof body.instructions === "string" && body.instructions) {
+    workerMessages = [{ role: "system", content: body.instructions }, ...workerMessages];
+  }
+  if (!workerMessages.length) {
+    return sendJson(res, 400, { error: { message: "input (string|array) or messages required", type: "invalid_request_error", code: "bad_request" } });
+  }
+  const stream = body.stream === true;
+  const respId = "resp_" + rid();
+  const created = Math.floor(Date.now() / 1000);
+  const logTag = `RSP/${model}/${respId.slice(-6)}`;
+  const inputTokens = estTokens(JSON.stringify(workerMessages));
+
+  const t0 = Date.now();
+  trace(`${logTag} START stream=${stream}`);
+  // Modo agéntico: si el cliente ofrece tools tipo function, inyectar
+  // catálogo como prompt sistema para que el worker emita EXEC::: y
+  // convertirlo a function_call nativo.
+  const fnTools = Array.isArray(body.tools) ? body.tools.filter((t) => t && t.type === "function" && t.name) : [];
+  if (fnTools.length && body.tool_choice !== "none") {
+    const sys = agentSystemPrompt(body.tools);
+    if (sys) workerMessages = [{ role: "system", content: sys }, ...workerMessages];
+  }
+  let resolved;
+  try {
+    resolved = await resolveResponsesText(body, workerMessages, model, logTag);
+  } catch (e) {
+    return openaiError(res, 502, e.message);
+  }
+  const { result, status } = resolved;
+  const outputTokens = estTokens(result.text);
+  // Puente agéntico: EXEC::: -> function_call (+ message con el prefijo).
+  let toolCall = parseToolCall(result.text, fnTools);
+  if (!toolCall) {
+    // Fallback: primer bloque shell del texto -> exec_command.
+    const shellCmd = extractShellBlock(result.text);
+    const execTool = fnTools.find((t) => t.name === "exec_command");
+    if (shellCmd && execTool) {
+      const i = result.text.indexOf("```");
+      toolCall = { name: "exec_command", args: JSON.stringify({ cmd: shellCmd }), prefixText: result.text.slice(0, i).trim() };
+      trace(`${logTag} SHELL-BLOCK-CALL cmd=${shellCmd.slice(0, 200)}`);
+    }
+  }
+  if (!toolCall && fnTools.length) {
+    // Reintento dirigido: pedir SOLO el bloque EXEC (los modelos
+    // freemodels lo emiten con prompt mínimo, pero divagan con contexto).
+    try {
+      const names = fnTools.map((t) => t.name).slice(0, 8).join(", ");
+      const strictMsgs = [
+        ...workerMessages,
+        { role: "user", content: `Responde SOLO con el bloque exacto (sin otro texto): EXEC:::<una de: ${names}> ARGS <json>. Si no corresponde usar herramientas, responde SIN bloque.` },
+      ];
+      trace(`${logTag} FC-RETRY tools=${names}`);
+      const r2 = await fetchCompleteText({ messages: strictMsgs, modelId: model, thinking: false, deepSearch: false, signal: null, logTag: logTag + "/fc2" });
+      const tc2 = parseToolCall(r2.text, fnTools);
+      if (tc2) {
+        toolCall = tc2;
+        trace(`${logTag} FC-RETRY-OK name=${tc2.name}`);
+      } else {
+        trace(`${logTag} FC-RETRY-MISS chars=${r2.text.length}`);
+      }
+    } catch (e) {
+      trace(`${logTag} FC-RETRY-FAIL err=${e.message}`);
+    }
+  }
+  let outputItems;
+  let fcItem = null;
+  if (toolCall) {
+    const msgPart = toolCall.prefixText
+      ? [{ type: "output_text", text: toolCall.prefixText, annotations: [] }]
+      : [];
+    const msgItem = {
+      type: "message", id: "msg_" + rid(), status: "completed",
+      role: "assistant", content: msgPart,
+    };
+    fcItem = {
+      type: "function_call", id: "fc_" + rid(), call_id: "call_" + rid().slice(0, 20),
+      status: "completed", name: toolCall.name, arguments: toolCall.args,
+    };
+    outputItems = msgPart.length ? [msgItem, fcItem] : [fcItem];
+    trace(`${logTag} TOOL-CALL name=${toolCall.name} args=${toolCall.args.slice(0, 200)}`);
+  } else {
+    outputItems = [{
+      type: "message", id: "msg_" + rid(), status: status === "completed" ? "completed" : "incomplete",
+      role: "assistant", content: [{ type: "output_text", text: result.text, annotations: [] }],
+    }];
+  }
+  const outputItem = outputItems[outputItems.length - 1];
+
+  if (!stream) {
+    trace(`${logTag} SERVED chars=${result.text.length} status=${status} toolCall=${toolCall ? toolCall.name : "-"} elapsed=${Date.now() - t0}ms`);
+    return sendJson(res, 200, {
+      id: respId, object: "response", created, model,
+      status, output: outputItems, parallel_tool_calls: true, tool_choice: "auto", tools: [],
+      usage: { input_tokens: inputTokens, output_tokens: outputTokens, total_tokens: inputTokens + outputTokens },
+    });
+  }
+
+  res.writeHead(200, {
+    "content-type": "text/event-stream",
+    "cache-control": "no-cache",
+    connection: "keep-alive",
+    "access-control-allow-origin": "*",
+  });
+  const send = (ev, d) => res.write("event: " + ev + "\ndata: " + JSON.stringify(d) + "\n\n");
+  let closed = false;
+  req.on("close", () => { closed = true; });
+  if (fcItem) {
+    // Secuencia Responses para function_call.
+    if (!closed) {
+      send("response.created", { type: "response.created", response: { id: respId, object: "response", created, model, status: "in_progress", output: [] } });
+      let oi = 0;
+      for (const it of outputItems) {
+        if (it.type === "message") {
+          send("response.output_item.added", { type: "response.output_item.added", output_index: oi, item: { type: "message", id: it.id, status: "in_progress", role: "assistant", content: [] } });
+          if (it.content.length) {
+            send("response.content_part.added", { type: "response.content_part.added", item_id: it.id, output_index: oi, content_index: 0, part: { type: "output_text", text: "", annotations: [] } });
+            send("response.output_text.delta", { type: "response.output_text.delta", item_id: it.id, output_index: oi, content_index: 0, delta: it.content[0].text, logprobs: [] });
+            send("response.output_text.done", { type: "response.output_text.done", item_id: it.id, output_index: oi, content_index: 0, text: it.content[0].text, logprobs: [] });
+            send("response.content_part.done", { type: "response.content_part.done", item_id: it.id, output_index: oi, content_index: 0, part: it.content[0] });
+          }
+          send("response.output_item.done", { type: "response.output_item.done", output_index: oi, item: it });
+          oi++;
+        } else {
+          send("response.output_item.added", { type: "response.output_item.added", output_index: oi, item: { type: "function_call", id: it.id, status: "in_progress", name: it.name, arguments: "", call_id: it.call_id } });
+          const A = it.arguments;
+          for (let k = 0; k < A.length && !closed; k += 48) {
+            send("response.function_call_arguments.delta", { type: "response.function_call_arguments.delta", item_id: it.id, output_index: oi, delta: A.slice(k, k + 48) });
+          }
+          send("response.function_call_arguments.done", { type: "response.function_call_arguments.done", item_id: it.id, output_index: oi, arguments: A });
+          send("response.output_item.done", { type: "response.output_item.done", output_index: oi, item: it });
+          oi++;
+        }
+      }
+      send("response.completed", {
+        type: "response.completed",
+        response: {
+          id: respId, object: "response", created, model, status,
+          output: outputItems, parallel_tool_calls: true, tool_choice: "auto", tools: [],
+          usage: { input_tokens: inputTokens, output_tokens: outputTokens, total_tokens: inputTokens + outputTokens },
+        },
+      });
+    }
+    trace(`${logTag} SERVED-FC name=${fcItem.name} elapsed=${Date.now() - t0}ms`);
+    return res.end();
+  }
+  if (!closed) {
+    send("response.created", { type: "response.created", response: { id: respId, object: "response", created, model, status: "in_progress", output: [] } });
+    send("response.output_item.added", { type: "response.output_item.added", output_index: 0, item: { type: "message", id: outputItem.id, status: "in_progress", role: "assistant", content: [] } });
+    send("response.content_part.added", { type: "response.content_part.added", item_id: outputItem.id, output_index: 0, content_index: 0, part: { type: "output_text", text: "", annotations: [] } });
+  }
+  const CH = 24;
+  for (let i = 0; i < result.text.length && !closed; i += CH) {
+    send("response.output_text.delta", { type: "response.output_text.delta", item_id: outputItem.id, output_index: 0, content_index: 0, delta: result.text.slice(i, i + CH), logprobs: [] });
+  }
+  if (!closed) {
+    send("response.output_text.done", { type: "response.output_text.done", item_id: outputItem.id, output_index: 0, content_index: 0, text: result.text, logprobs: [] });
+    send("response.content_part.done", { type: "response.content_part.done", item_id: outputItem.id, output_index: 0, content_index: 0, part: { type: "output_text", text: result.text, annotations: [] } });
+    send("response.output_item.done", { type: "response.output_item.done", output_index: 0, item: outputItem });
+    send("response.completed", {
+      type: "response.completed",
+      response: {
+        id: respId, object: "response", created, model, status,
+        output: outputItems, parallel_tool_calls: true, tool_choice: "auto", tools: [],
+        usage: { input_tokens: inputTokens, output_tokens: outputTokens, total_tokens: inputTokens + outputTokens },
+      },
+    });
+  }
+  trace(`${logTag} SERVED chars=${result.text.length} status=${status} elapsed=${Date.now() - t0}ms`);
+  res.end();
+}
+
 async function handleMessages(req, res, body) {
   stats.requests++;
   const model = stripPrefix(body.model);
@@ -528,6 +865,12 @@ const server = http.createServer(async (req, res) => {
       try { body = JSON.parse(await readBody(req)); }
       catch { return anthropicError(res, 400, "invalid JSON body"); }
       return handleMessages(req, res, body);
+    }
+    if (req.method === "POST" && (path === "/v1/responses" || path === "/responses")) {
+      let body;
+      try { body = JSON.parse(await readBody(req)); }
+      catch { return sendJson(res, 400, { error: { message: "invalid JSON body", type: "invalid_request_error", code: "bad_request" } }); }
+      return handleResponses(req, res, body);
     }
     return sendJson(res, 404, { error: "not found: " + path });
   } catch (e) {

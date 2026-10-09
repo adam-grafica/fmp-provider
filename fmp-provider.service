@@ -10,7 +10,7 @@ WorkingDirectory=/home/adamcloud/platform/gateways/fmp-provider
 Environment=HOME=/home/adamcloud
 Environment=PORT=2089
 Environment=HOST=127.0.0.1
-Environment=FMP_MAX_RETRIES=3
+Environment=FMP_MAX_RETRIES=5
 ExecStart=/usr/bin/node /home/adamcloud/platform/gateways/fmp-provider/server.js
 Restart=always
 RestartSec=3
