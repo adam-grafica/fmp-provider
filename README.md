@@ -56,6 +56,17 @@ Límite conocido: el worker a veces genera el comando impreciso
 el `finish_reason`/`status` refleja el resultado. Codex pide aprobación
 antes de ejecutar: no hay ejecución ciega.
 
+## Tool-use nativo OpenAI + Anthropic (v1.3.0)
+
+`POST /v1/chat/completions` y `POST /v1/messages` aceptan `tools` y
+`tool_choice`, y emiten `tool_calls` / `tool_use` nativos con el mismo
+puente de 3 niveles (EXEC → bloque shell → reintento dirigido). Rondas
+`role: tool` / `tool_result` se mapean al worker para continuar la
+conversación. Verificado: OAI + ANT, stream + no-stream, vía gateway.
+Límite: con el contexto completo de Codex (20 tools + environment con
+mención a sandbox), el worker a veces se niega a emitir EXEC; el puente
+convierte cuando el worker coopera.
+
 ## Modelos (8)
 
 `claude-opus-5.5`, `claude-sonnet-5`, `claude-fable-5`, `claude-fable-5.1`,

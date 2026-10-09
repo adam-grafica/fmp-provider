@@ -1,4 +1,4 @@
-// FMP — FreeModels Provider v1.2.0
+// FMP — FreeModels Provider v1.3.0
 // Traductor OpenAI-compatible + Anthropic-compatible hacia freemodels.pro.
 // Sin dependencias. Loopback-only por defecto (127.0.0.1:2089).
 //
@@ -119,8 +119,20 @@ function toWorkerMessagesOA(messages) {
   const out = [];
   for (const m of messages || []) {
     if (!m || typeof m !== "object") continue;
+    if (m.role === "tool") {
+      out.push({ role: "user", content: `[resultado de herramienta ${m.tool_call_id || ""}]\n${textOfContent(m.content)}`.trim() });
+      continue;
+    }
     const role = m.role === "system" || m.role === "user" || m.role === "assistant" ? m.role : "user";
-    out.push({ role, content: textOfContent(m.content) });
+    let text = textOfContent(m.content);
+    if (role === "assistant" && Array.isArray(m.tool_calls) && m.tool_calls.length) {
+      for (const tc of m.tool_calls) {
+        const fn = (tc && tc.function) || {};
+        text += `\n[llamada a herramienta ${fn.name || (tc && tc.id) || ""}] ${fn.arguments || ""}`.trimEnd();
+      }
+      text = text.trim();
+    }
+    out.push({ role, content: text });
   }
   return out;
 }
@@ -134,8 +146,20 @@ function toWorkerMessagesAnt(system, messages) {
   }
   for (const m of messages || []) {
     if (!m || typeof m !== "object") continue;
+    // tool_result -> worker lo ve como dato del usuario.
+    if (m.role === "tool" || m.role === "user" || (m.role !== "assistant" && m.type === "tool_result")) {
+      out.push({ role: "user", content: textOfContent(m.content) });
+      continue;
+    }
     const role = m.role === "assistant" ? "assistant" : "user";
-    out.push({ role, content: textOfContent(m.content) });
+    let text = textOfContent(m.content);
+    // tool_use nativo Anthropic -> texto para el worker.
+    if (role === "assistant" && Array.isArray(m.content)) {
+      const uses = m.content.filter((p) => p && p.type === "tool_use");
+      for (const u of uses) text += `\n[llamada a herramienta ${u.name || ""}] ${JSON.stringify(u.input || {})}`;
+      text = text.trim();
+    }
+    out.push({ role, content: text });
   }
   return out;
 }
@@ -316,7 +340,7 @@ function handleHealth(res) {
   sendJson(res, 200, {
     ok: true,
     service: "fmp-provider",
-    version: "1.2.0",
+    version: "1.3.0",
     upstream: UPSTREAM,
     models: MODELS.map((m) => m.id),
     uptime_s: Math.floor((Date.now() - startedAt) / 1000),
@@ -344,34 +368,72 @@ async function handleChatCompletions(req, res, body) {
   const created = Math.floor(Date.now() / 1000);
   const logTag = `OAI/${model}/${id.slice(-6)}`;
 
-  if (!stream) {
-    let upstream;
+  // Puente tool-use: si el cliente declara tools, pedir EXEC::: al worker.
+  const oaiTools = Array.isArray(body.tools) ? body.tools : [];
+  const oaiDefs = toolDefsForWorker(oaiTools.map((t) => (t && t.function ? { type: "function", name: t.function.name, description: t.function.description, parameters: t.function.parameters } : t)));
+  let wm = workerMessages;
+  if (oaiDefs.length && body.tool_choice !== "none") {
+    const sys = agentSystemPrompt(oaiTools);
+    if (sys) wm = [{ role: "system", content: sys }, ...workerMessages];
+  }
+
+  // Obtiene texto íntegro (SSE + retry + fallback JSON). Reutilizado
+  // por ramas stream y no-stream.
+  async function getOAIText() {
+    const r = await fetchCompleteText({ messages: wm, modelId: model, thinking, deepSearch, signal: null, logTag });
+    if (r.complete) return { text: r.text, complete: true, finish: "stop" };
     try {
-      upstream = await callUpstream({ messages: workerMessages, modelId: model, stream: false, thinking, deepSearch, signal: null });
+      const ju = await callUpstream({ messages: wm, modelId: model, stream: false, thinking, deepSearch, signal: null });
+      const jtext = await readWorkerJson(ju);
+      if (jtext.length >= r.text.length && jtext.length > 0) {
+        trace(`${logTag} FALLBACK-OK chars=${jtext.length}`);
+        return { text: jtext, complete: true, finish: "stop" };
+      }
+      return { text: r.text, complete: false, finish: "length" };
+    } catch (e) {
+      trace(`${logTag} FALLBACK-FAIL err=${e.message}`);
+      return { text: r.text, complete: false, finish: "length" };
+    }
+  }
+
+  if (!stream) {
+    let got;
+    try {
+      got = await getOAIText();
     } catch (e) {
       stats.errors++;
       return openaiError(res, e.status && e.status < 500 ? e.status : 502, e.message);
     }
-    let full = "";
-    try {
-      full = await readWorkerJson(upstream);
-    } catch (e) {
-      stats.errors++;
-      return openaiError(res, 502, "upstream read failed: " + e.message);
+    const tc = oaiDefs.length ? await resolveToolCall(got.text, oaiDefs, wm, model, logTag) : null;
+    if (tc) {
+      trace(`${logTag} TOOL-CALL name=${tc.name}`);
+      return sendJson(res, 200, {
+        id, object: "chat.completion", created, model,
+        choices: [{
+          index: 0,
+          message: {
+            role: "assistant",
+            content: tc.prefixText || null,
+            tool_calls: [{ id: "call_" + rid().slice(0, 20), type: "function", function: { name: tc.name, arguments: tc.args } }],
+          },
+          finish_reason: "tool_calls",
+        }],
+        usage: { prompt_tokens: estTokens(JSON.stringify(wm)), completion_tokens: estTokens(got.text), total_tokens: 0 },
+      });
     }
     return sendJson(res, 200, {
       id, object: "chat.completion", created, model,
-      choices: [{ index: 0, message: { role: "assistant", content: full }, finish_reason: "stop" }],
-      usage: { prompt_tokens: estTokens(JSON.stringify(workerMessages)), completion_tokens: estTokens(full), total_tokens: 0 },
+      choices: [{ index: 0, message: { role: "assistant", content: got.text }, finish_reason: got.finish }],
+      usage: { prompt_tokens: estTokens(JSON.stringify(wm)), completion_tokens: estTokens(got.text), total_tokens: 0 },
     });
   }
 
   // STREAM: buffer anti-truncamiento primero, emitir después.
   const t0 = Date.now();
-  trace(`${logTag} START msgs=${workerMessages.length}`);
+  trace(`${logTag} START msgs=${wm.length} tools=${oaiDefs.length}`);
   let result;
   try {
-    result = await fetchCompleteText({ messages: workerMessages, modelId: model, thinking, deepSearch, signal: null, logTag });
+    result = await fetchCompleteText({ messages: wm, modelId: model, thinking, deepSearch, signal: null, logTag });
   } catch (e) {
     stats.errors++;
     // Fallback: error SSE bien formado en vez de colgar.
@@ -388,7 +450,7 @@ async function handleChatCompletions(req, res, body) {
   if (!result.complete) {
     try {
       trace(`${logTag} FALLBACK-JSON charsSoFar=${result.text.length}`);
-      const ju = await callUpstream({ messages: workerMessages, modelId: model, stream: false, thinking, deepSearch, signal: null });
+      const ju = await callUpstream({ messages: wm, modelId: model, stream: false, thinking, deepSearch, signal: null });
       const jtext = await readWorkerJson(ju);
       if (jtext.length >= result.text.length && jtext.length > 0) {
         result = { text: jtext, attempts: result.attempts + 1, complete: true, aborted: false };
@@ -401,6 +463,12 @@ async function handleChatCompletions(req, res, body) {
       trace(`${logTag} FALLBACK-FAIL err=${e.message}`);
     }
   }
+  // Puente tool-use en stream (centralizado: EXEC -> shell-block -> retry).
+  const tcS = oaiDefs.length ? await resolveToolCall(result.text, oaiDefs, wm, model, logTag) : null;
+  if (tcS) {
+    finishReason = "tool_calls";
+    trace(`${logTag} TOOL-CALL name=${tcS.name}`);
+  }
 
   res.writeHead(200, {
     "content-type": "text/event-stream",
@@ -412,6 +480,20 @@ async function handleChatCompletions(req, res, body) {
   let closed = false;
   req.on("close", () => { closed = true; });
   send({ id, object: "chat.completion.chunk", created, model, choices: [{ index: 0, delta: { role: "assistant" }, finish_reason: null }] });
+  if (tcS) {
+    // Emisión tool_calls: prefijo como texto + llamada completa.
+    const tcId = "call_" + rid().slice(0, 20);
+    if (tcS.prefixText && !closed) {
+      send({ id, object: "chat.completion.chunk", created, model, choices: [{ index: 0, delta: { content: tcS.prefixText }, finish_reason: null }] });
+    }
+    if (!closed) {
+      send({ id, object: "chat.completion.chunk", created, model, choices: [{ index: 0, delta: { tool_calls: [{ index: 0, id: tcId, type: "function", function: { name: tcS.name, arguments: tcS.args } }] }, finish_reason: null }] });
+      send({ id, object: "chat.completion.chunk", created, model, choices: [{ index: 0, delta: {}, finish_reason: "tool_calls" }] });
+      res.write("data: [DONE]\n\n");
+    }
+    trace(`${logTag} SERVED-FC name=${tcS.name} elapsed=${Date.now() - t0}ms`);
+    return res.end();
+  }
   // Re-emitir en trozos pequeños para preservar UX de streaming.
   const CH = 24;
   for (let i = 0; i < result.text.length && !closed; i += CH) {
@@ -518,10 +600,52 @@ function extractShellBlock(text) {
   return cmd;
 }
 
+// Resuelve llamada a herramienta con 3 niveles:
+// 1. EXEC::: explícito. 2. bloque shell -> exec_command.
+// 3. reintento dirigido que pide SOLO el bloque.
+async function resolveToolCall(text, defs, wm, modelId, logTag) {
+  let tc = parseToolCall(text, defs);
+  if (tc) return tc;
+  const shellCmd = extractShellBlock(text);
+  const execTool = (defs || []).find((t) => t.name === "exec_command");
+  if (shellCmd && execTool) {
+    const i = text.indexOf("```");
+    trace(`${logTag} SHELL-BLOCK-CALL cmd=${shellCmd.slice(0, 200)}`);
+    return { name: "exec_command", args: JSON.stringify({ cmd: shellCmd }), prefixText: text.slice(0, i).trim() };
+  }
+  if (defs && defs.length && wm && modelId) {
+    try {
+      const names = defs.map((t) => t.name).slice(0, 8).join(", ");
+      const strictMsgs = [
+        ...wm,
+        { role: "user", content: `Responde SOLO con el bloque exacto (sin otro texto, sin explicaciones, sin mencionar el entorno ni permisos): EXEC:::<una de: ${names}> ARGS <json>. Si no corresponde usar herramientas, responde SIN bloque.` },
+      ];
+      trace(`${logTag} FC-RETRY tools=${names}`);
+      const r2 = await fetchCompleteText({ messages: strictMsgs, modelId, thinking: false, deepSearch: false, signal: null, logTag: logTag + "/fc2" });
+      const tc2 = parseToolCall(r2.text, defs);
+      if (tc2) {
+        trace(`${logTag} FC-RETRY-OK name=${tc2.name}`);
+        return tc2;
+      }
+      trace(`${logTag} FC-RETRY-MISS chars=${r2.text.length}`);
+    } catch (e) {
+      trace(`${logTag} FC-RETRY-FAIL err=${e.message}`);
+    }
+  }
+  return null;
+}
+
 function toolDefsForWorker(tools) {
   return (tools || [])
-    .filter((t) => t && t.type === "function" && t.name)
-    .map((t) => ({ name: t.name, description: String(t.description || "").slice(0, 400), params: t.parameters || {} }))
+    .filter((t) => t && (t.type === "function" || t.name) && (t.name || (t.function && t.function.name)))
+    .map((t) => {
+      const fn = t.type === "function" ? t : { name: t.name, description: t.description, parameters: t.input_schema };
+      const name = fn.name || (t.function && t.function.name) || "";
+      const desc = fn.description || (t.function && t.function.description) || "";
+      const params = fn.parameters || (t.function && t.function.parameters) || {};
+      return { name, description: String(desc).slice(0, 400), params };
+    })
+    .filter((d) => d.name)
     .slice(0, 25);
 }
 
@@ -620,40 +744,9 @@ async function handleResponses(req, res, body) {
   }
   const { result, status } = resolved;
   const outputTokens = estTokens(result.text);
-  // Puente agéntico: EXEC::: -> function_call (+ message con el prefijo).
-  let toolCall = parseToolCall(result.text, fnTools);
-  if (!toolCall) {
-    // Fallback: primer bloque shell del texto -> exec_command.
-    const shellCmd = extractShellBlock(result.text);
-    const execTool = fnTools.find((t) => t.name === "exec_command");
-    if (shellCmd && execTool) {
-      const i = result.text.indexOf("```");
-      toolCall = { name: "exec_command", args: JSON.stringify({ cmd: shellCmd }), prefixText: result.text.slice(0, i).trim() };
-      trace(`${logTag} SHELL-BLOCK-CALL cmd=${shellCmd.slice(0, 200)}`);
-    }
-  }
-  if (!toolCall && fnTools.length) {
-    // Reintento dirigido: pedir SOLO el bloque EXEC (los modelos
-    // freemodels lo emiten con prompt mínimo, pero divagan con contexto).
-    try {
-      const names = fnTools.map((t) => t.name).slice(0, 8).join(", ");
-      const strictMsgs = [
-        ...workerMessages,
-        { role: "user", content: `Responde SOLO con el bloque exacto (sin otro texto): EXEC:::<una de: ${names}> ARGS <json>. Si no corresponde usar herramientas, responde SIN bloque.` },
-      ];
-      trace(`${logTag} FC-RETRY tools=${names}`);
-      const r2 = await fetchCompleteText({ messages: strictMsgs, modelId: model, thinking: false, deepSearch: false, signal: null, logTag: logTag + "/fc2" });
-      const tc2 = parseToolCall(r2.text, fnTools);
-      if (tc2) {
-        toolCall = tc2;
-        trace(`${logTag} FC-RETRY-OK name=${tc2.name}`);
-      } else {
-        trace(`${logTag} FC-RETRY-MISS chars=${r2.text.length}`);
-      }
-    } catch (e) {
-      trace(`${logTag} FC-RETRY-FAIL err=${e.message}`);
-    }
-  }
+  // Puente agéntico centralizado (EXEC -> shell-block -> reintento).
+  const toolCall = fnTools.length ? await resolveToolCall(result.text, fnTools, workerMessages, model, logTag) : null;
+  if (toolCall) trace(`${logTag} TOOL-CALL name=${toolCall.name} args=${toolCall.args.slice(0, 200)}`);
   let outputItems;
   let fcItem = null;
   if (toolCall) {
@@ -777,11 +870,22 @@ async function handleMessages(req, res, body) {
   const logTag = `ANT/${model}/${msgId.slice(-6)}`;
   void maxTokens;
 
+  // Puente tool-use Anthropic: tools [{name, description, input_schema}].
+  const antTools = Array.isArray(body.tools) ? body.tools : [];
+  const antDefs = toolDefsForWorker(antTools.map((t) => ({ type: "function", name: t.name, description: t.description, parameters: t.input_schema })));
+  let wmAnt = workerMessages;
+  const antChoice = body.tool_choice;
+  const antDisabled = antChoice && (antChoice.type === "none" || antChoice === "none");
+  if (antDefs.length && !antDisabled) {
+    const sys = agentSystemPrompt(antTools);
+    if (sys) wmAnt = [{ role: "system", content: sys }, ...workerMessages];
+  }
+
   const t0 = Date.now();
-  trace(`${logTag} START msgs=${workerMessages.length} stream=${stream}`);
+  trace(`${logTag} START msgs=${wmAnt.length} stream=${stream} tools=${antDefs.length}`);
   let result;
   try {
-    result = await fetchCompleteText({ messages: workerMessages, modelId: model, thinking: false, deepSearch: false, signal: null, logTag });
+    result = await fetchCompleteText({ messages: wmAnt, modelId: model, thinking: false, deepSearch: false, signal: null, logTag });
   } catch (e) {
     stats.errors++;
     return anthropicError(res, 502, e.message);
@@ -791,7 +895,7 @@ async function handleMessages(req, res, body) {
   if (!result.complete) {
     try {
       trace(`${logTag} FALLBACK-JSON charsSoFar=${result.text.length}`);
-      const ju = await callUpstream({ messages: workerMessages, modelId: model, stream: false, thinking: false, deepSearch: false, signal: null });
+      const ju = await callUpstream({ messages: wmAnt, modelId: model, stream: false, thinking: false, deepSearch: false, signal: null });
       const jtext = await readWorkerJson(ju);
       if (jtext.length >= result.text.length && jtext.length > 0) {
         result = { text: jtext, attempts: result.attempts + 1, complete: true, aborted: false };
@@ -804,11 +908,25 @@ async function handleMessages(req, res, body) {
       trace(`${logTag} FALLBACK-FAIL err=${e.message}`);
     }
   }
+  // Puente: EXEC/shell-block/retry centralizado.
+  const tcAnt = antDefs.length && !antDisabled ? await resolveToolCall(result.text, antDefs, wmAnt, model, logTag) : null;
+  let antContent;
+  if (tcAnt) {
+    let input = {};
+    try { input = JSON.parse(tcAnt.args); } catch { input = {}; }
+    antContent = [];
+    if (tcAnt.prefixText) antContent.push({ type: "text", text: tcAnt.prefixText });
+    antContent.push({ type: "tool_use", id: "toolu_" + rid().slice(0, 20), name: tcAnt.name, input });
+    antStop = "tool_use";
+    trace(`${logTag} TOOL-CALL name=${tcAnt.name}`);
+  } else {
+    antContent = [{ type: "text", text: result.text }];
+  }
 
   if (!stream) {
     return sendJson(res, 200, {
       id: msgId, type: "message", role: "assistant", model,
-      content: [{ type: "text", text: result.text }],
+      content: antContent,
       stop_reason: antStop,
       stop_sequence: null,
       usage: { input_tokens: inputTokens, output_tokens: estTokens(result.text) },
@@ -827,14 +945,34 @@ async function handleMessages(req, res, body) {
   const ev = (name, d) => ({ _ev: name, _d: d });
   if (!closed) {
     send(ev("message_start", { type: "message_start", message: { id: msgId, type: "message", role: "assistant", model, content: [], stop_reason: null, stop_sequence: null, usage: { input_tokens: inputTokens, output_tokens: 1 } } }));
-    send(ev("content_block_start", { type: "content_block_start", index: 0, content_block: { type: "text", text: "" } }));
+    let si = 0;
+    for (const b of antContent) {
+      if (b.type === "text") {
+        send(ev("content_block_start", { type: "content_block_start", index: si, content_block: { type: "text", text: "" } }));
+      } else {
+        send(ev("content_block_start", { type: "content_block_start", index: si, content_block: { type: "tool_use", id: b.id, name: b.name, input: {} } }));
+      }
+      si++;
+    }
   }
-  const CH = 24;
-  for (let i = 0; i < result.text.length && !closed; i += CH) {
-    send(ev("content_block_delta", { type: "content_block_delta", index: 0, delta: { type: "text_delta", text: result.text.slice(i, i + CH) } }));
+  let bi = 0;
+  for (const b of antContent) {
+    if (closed) break;
+    if (b.type === "text") {
+      const CH = 24;
+      for (let i = 0; i < b.text.length && !closed; i += CH) {
+        send(ev("content_block_delta", { type: "content_block_delta", index: bi, delta: { type: "text_delta", text: b.text.slice(i, i + CH) } }));
+      }
+      if (!closed) send(ev("content_block_stop", { type: "content_block_stop", index: bi }));
+    } else {
+      if (!closed) {
+        send(ev("content_block_delta", { type: "content_block_delta", index: bi, delta: { type: "input_json_delta", partial_json: JSON.stringify(b.input) } }));
+        send(ev("content_block_stop", { type: "content_block_stop", index: bi }));
+      }
+    }
+    bi++;
   }
   if (!closed) {
-    send(ev("content_block_stop", { type: "content_block_stop", index: 0 }));
     send(ev("message_delta", { type: "message_delta", delta: { stop_reason: antStop, stop_sequence: null }, usage: { output_tokens: estTokens(result.text) } }));
     send(ev("message_stop", { type: "message_stop" }));
   }
