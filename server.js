@@ -1,16 +1,19 @@
-// FMP — FreeModels Provider v1.3.0
+// FMP — FreeModels Provider v2.1.0
 // Traductor OpenAI-compatible + Anthropic-compatible hacia freemodels.pro.
 // Sin dependencias. Loopback-only por defecto (127.0.0.1:2089).
 //
-// Hallazgo que motiva el diseño (2026-10-09, evidencia en mano):
-// el worker upstream CORTA el SSE de forma intermitente (~1/3 de los casos):
-// cierra la conexión a mitad de frase SIN emitir `data: [DONE]`.
-// Estrategia: pedir `stream:true` al worker SIEMPRE en modo stream,
-// acumular fragmentos en buffer hasta ver [DONE]; si el socket muere
-// sin DONE, reintentar con backoff (hasta MAX_RETRIES) y CONTINUAR
-// desde donde quedó (resume por longitud de texto). Solo cuando el
-// texto total está íntegro se emite al cliente. En modo no-stream se
-// pide JSON directo al worker.
+// Diseño v2 (2026-10-09, evidencia en mano):
+// - El worker CORTA el SSE intermitente sin `data: [DONE]`. Estrategia:
+//   LIVE pass-through: cada fragmento se reemite al cliente en cuanto
+//   llega (TTFB ~1s, streaming visible real). Si el socket muere sin DONE
+//   y hay tools pendientes, se marca y reintenta en background; el texto
+//   ya emitido se conserva (dedupe por prefijo en reintento).
+// - El worker NO tiene canal thinking separado: todo es texto corrido.
+//   FMP NO fabrica thinking falso. `thinking:true` se reenvía al worker
+//   (respuestas con razonamiento paso a paso en el texto) y en Anthropic
+//   se expone `thinking` solo como flag informativo en /health.
+// - Plan premium: tiers por API key (free/pro), rate-limit, cola con
+//   prioridad, métricas por tier en /health y /v1/usage.
 //
 // Endpoints:
 //   GET  /health | /
@@ -34,6 +37,61 @@ const MAX_RETRIES = Number(process.env.FMP_MAX_RETRIES || 5);
 const RETRY_BASE_MS = Number(process.env.FMP_RETRY_BASE_MS || 1500);
 const TRACE_FILE = process.env.SHIM_TRACE || process.env.FMP_TRACE || "";
 
+// ---- Plan premium: tiers, rate-limit, cola ----
+// Tiers por API key (Authorization: Bearer <key> o x-api-key).
+// FMP_KEYS="key1:tier,key2:tier" ej: "sk-lan:pro,sk-casa:free".
+// Sin key configurada: todo pasa como free sin límite (modo local).
+const TIER_LIMITS = {
+  free: { rpm: Number(process.env.FMP_FREE_RPM || 10), concurrency: Number(process.env.FMP_FREE_CONC || 2) },
+  pro: { rpm: Number(process.env.FMP_PRO_RPM || 120), concurrency: Number(process.env.FMP_PRO_CONC || 16) },
+};
+const KEY_TIERS = {};
+for (const pair of String(process.env.FMP_KEYS || "").split(",").map((s) => s.trim()).filter(Boolean)) {
+  const [k, t] = pair.split(":");
+  if (k) KEY_TIERS[k] = t === "pro" ? "pro" : "free";
+}
+const tierState = {
+  free: { inFlight: 0, hits: [] },
+  pro: { inFlight: 0, hits: [] },
+};
+const usage = { free: { requests: 0, tokens: 0, errors: 0 }, pro: { requests: 0, tokens: 0, errors: 0 }, local: { requests: 0, tokens: 0, errors: 0 } };
+
+function tierOf(req) {
+  const h = req.headers["authorization"] || req.headers["x-api-key"] || "";
+  const key = String(h).replace(/^bearer\s+/i, "").trim();
+  if (!key) return "local";
+  return KEY_TIERS[key] || "local";
+}
+
+function checkLimit(tier) {
+  if (tier === "local") return null;
+  const lim = TIER_LIMITS[tier];
+  const st = tierState[tier];
+  const now = Date.now();
+  st.hits = st.hits.filter((t) => now - t < 60_000);
+  if (st.hits.length >= lim.rpm) return { retryAfter: 60 - Math.floor((now - st.hits[0]) / 1000), reason: "rpm" };
+  if (st.inFlight >= lim.concurrency) return { retryAfter: 2, reason: "concurrency" };
+  return null;
+}
+
+function takeSlot(tier) {
+  if (tier === "local") return () => {};
+  const st = tierState[tier];
+  st.hits.push(Date.now());
+  st.inFlight++;
+  usage[tier].requests++;
+  return () => { st.inFlight = Math.max(0, st.inFlight - 1); };
+}
+
+function limitResponse(res, info) {
+  res.writeHead(429, {
+    "content-type": "application/json",
+    "retry-after": String(info.retryAfter || 5),
+    "access-control-allow-origin": "*",
+  });
+  res.end(JSON.stringify({ error: { message: `rate limit (${info.reason}), retry in ${info.retryAfter || 5}s — plan premium avaliable`, type: "rate_limit_error", code: "rate_limited" } }));
+}
+
 const MODELS = [
   { id: "claude-opus-5.5", name: "Claude Opus 5.5", owned_by: "anthropic" },
   { id: "claude-sonnet-5", name: "Claude Sonnet 5", owned_by: "anthropic" },
@@ -51,6 +109,16 @@ const stats = { requests: 0, retries: 0, truncatedUpstream: 0, errors: 0 };
 const rid = () => crypto.randomBytes(12).toString("hex");
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const estTokens = (s) => Math.max(1, Math.ceil((s || "").length / 4));
+
+// Límite profesional: el worker ignora max_tokens, así que FMP trunca.
+// ~4 chars por token. Devuelve { text, hit }.
+function applyMaxTokens(text, maxTokens) {
+  const cap = Number(maxTokens);
+  if (!cap || cap <= 0 || !text) return { text: text || "", hit: false };
+  const maxChars = Math.floor(cap * 4);
+  if (text.length <= maxChars) return { text, hit: false };
+  return { text: text.slice(0, maxChars), hit: true };
+}
 
 function trace(msg) {
   if (!TRACE_FILE) return;
@@ -204,14 +272,28 @@ async function callUpstream({ messages, modelId, stream, thinking, deepSearch, s
   }
 }
 
-// Lee UN intento SSE del worker. Devuelve { text, done }.
-// done=true solo si se vio `data: [DONE]`. Sin DONE = truncado.
-async function readWorkerSSEOnce(response, signal) {
+// Lee UN intento SSE del worker EN VIVO: cada fragmento se entrega a
+// onPiece en cuanto llega (streaming real, TTFB ~1s). Devuelve
+// { text, done }. done=true solo si se vio `data: [DONE]`.
+async function readWorkerSSELive(response, onPiece, signal) {
   const reader = response.body.getReader();
   const dec = new TextDecoder("utf-8");
   let buf = "";
   let full = "";
   let done = false;
+  const emitPayload = async (payload) => {
+    if (!payload) return;
+    if (payload === "[DONE]") { done = true; return; }
+    try {
+      const j = JSON.parse(payload);
+      const c = j.choices && j.choices[0];
+      const piece = (c && c.delta && c.delta.content) || (c && c.message && c.message.content) || "";
+      if (piece) {
+        full += piece;
+        if (onPiece) await onPiece(piece);
+      }
+    } catch {}
+  };
   for (;;) {
     if (signal && signal.aborted) { try { await reader.cancel(); } catch {} break; }
     const { done: rd, value } = await reader.read();
@@ -222,34 +304,24 @@ async function readWorkerSSEOnce(response, signal) {
     for (const line of lines) {
       const t = line.trim();
       if (!t || !t.startsWith("data:")) continue;
-      const payload = t.slice(5).trim();
-      if (!payload) continue;
-      if (payload === "[DONE]") { done = true; continue; }
-      try {
-        const j = JSON.parse(payload);
-        const c = j.choices && j.choices[0];
-        const piece = (c && c.delta && c.delta.content) || (c && c.message && c.message.content) || "";
-        if (piece) full += piece;
-      } catch {}
+      await emitPayload(t.slice(5).trim());
     }
   }
-  // Cola final: puede traer DONE pegado sin \n (upstream lo hace a veces).
   const tail = (buf + dec.decode()).trim();
   if (tail) {
     for (const chunk of tail.split("\n")) {
       const t = chunk.trim();
       if (!t || !t.startsWith("data:")) continue;
-      const payload = t.slice(5).trim();
-      if (payload === "[DONE]") { done = true; continue; }
-      try {
-        const j = JSON.parse(payload);
-        const c = j.choices && j.choices[0];
-        const piece = (c && c.delta && c.delta.content) || "";
-        if (piece) full += piece;
-      } catch {}
+      await emitPayload(t.slice(5).trim());
     }
   }
   return { text: full, done };
+}
+
+// Lee UN intento SSE del worker. Devuelve { text, done }.
+// done=true solo si se vio `data: [DONE]`. Sin DONE = truncado.
+async function readWorkerSSEOnce(response, signal) {
+  return readWorkerSSELive(response, null, signal);
 }
 
 async function readWorkerJson(response) {
@@ -340,16 +412,32 @@ function handleHealth(res) {
   sendJson(res, 200, {
     ok: true,
     service: "fmp-provider",
-    version: "1.3.0",
+    version: "2.1.0",
     upstream: UPSTREAM,
     models: MODELS.map((m) => m.id),
     uptime_s: Math.floor((Date.now() - startedAt) / 1000),
     stats,
+    tiers: {
+      free: { ...TIER_LIMITS.free, inFlight: tierState.free.inFlight, usage: usage.free },
+      pro: { ...TIER_LIMITS.pro, inFlight: tierState.pro.inFlight, usage: usage.pro },
+      local: { usage: usage.local },
+    },
+    // Honestidad: el worker NO expone canal thinking separado; thinking:true
+    // se reenvía y el modelo razona en el texto. Sin bloques fabricados.
+    thinking: { mode: "worker-passthrough", separate_channel: false },
   });
+}
+
+function handleUsage(res) {
+  sendJson(res, 200, { object: "usage", usage, tiers: TIER_LIMITS, uptime_s: Math.floor((Date.now() - startedAt) / 1000) });
 }
 
 async function handleChatCompletions(req, res, body) {
   stats.requests++;
+  const tier = tierOf(req);
+  const limited = checkLimit(tier);
+  if (limited) { usage[tier].errors++; return limitResponse(res, limited); }
+  const release = takeSlot(tier);
   const model = stripPrefix(body.model);
   if (!MODEL_IDS.has(model)) {
     return sendJson(res, 404, {
@@ -363,6 +451,12 @@ async function handleChatCompletions(req, res, body) {
   const stream = body.stream === true;
   const thinking = !!body.thinking;
   const deepSearch = !!(body.deepSearch ?? body.deep_search);
+  // Límite profesional: el worker ignora max_tokens; FMP trunca y avisa
+  // con finish length (igual que API nativa). Default 4096.
+  const maxTokens = Number(body.max_tokens ?? body.max_completion_tokens) || 4096;
+  // stream_mode full: bufferiza íntegro y luego emite SSE (para rachas
+  // malas de upstream). Default live, como API nativa.
+  const fullMode = body.stream_mode === "full";
 
   const id = "chatcmpl-" + rid();
   const created = Math.floor(Date.now() / 1000);
@@ -402,11 +496,18 @@ async function handleChatCompletions(req, res, body) {
       got = await getOAIText();
     } catch (e) {
       stats.errors++;
+      usage[tier].errors++;
+      release();
       return openaiError(res, e.status && e.status < 500 ? e.status : 502, e.message);
     }
+    usage[tier].tokens += estTokens(got.text);
+    const capped = applyMaxTokens(got.text, maxTokens);
+    if (capped.hit) trace(`${logTag} MAXTOKENS cut=${got.text.length}->${capped.text.length}`);
+    got = { text: capped.text, complete: got.complete, finish: capped.hit ? "length" : got.finish };
     const tc = oaiDefs.length ? await resolveToolCall(got.text, oaiDefs, wm, model, logTag) : null;
     if (tc) {
       trace(`${logTag} TOOL-CALL name=${tc.name}`);
+      release();
       return sendJson(res, 200, {
         id, object: "chat.completion", created, model,
         choices: [{
@@ -421,6 +522,7 @@ async function handleChatCompletions(req, res, body) {
         usage: { prompt_tokens: estTokens(JSON.stringify(wm)), completion_tokens: estTokens(got.text), total_tokens: 0 },
       });
     }
+    release();
     return sendJson(res, 200, {
       id, object: "chat.completion", created, model,
       choices: [{ index: 0, message: { role: "assistant", content: got.text }, finish_reason: got.finish }],
@@ -428,48 +530,47 @@ async function handleChatCompletions(req, res, body) {
     });
   }
 
-  // STREAM: buffer anti-truncamiento primero, emitir después.
+  // STREAM EN VIVO: pass-through inmediato + resume si el worker corta.
+  // Sin tools: cada fragmento se reemite al llegar (TTFB ~1s, como API
+  // nativa). Si el socket muere sin DONE, se reintenta y solo se emite
+  // lo NUEVO (dedupe por prefijo); el cliente ve pausa breve, no corte.
+  // stream_mode full: bufferiza íntegro vía getOAIText y luego emite SSE
+  // (para rachas malas de upstream o clientes que prefieren completo).
   const t0 = Date.now();
-  trace(`${logTag} START msgs=${wm.length} tools=${oaiDefs.length}`);
-  let result;
-  try {
-    result = await fetchCompleteText({ messages: wm, modelId: model, thinking, deepSearch, signal: null, logTag });
-  } catch (e) {
-    stats.errors++;
-    // Fallback: error SSE bien formado en vez de colgar.
-    res.writeHead(200, { "content-type": "text/event-stream", "cache-control": "no-cache", connection: "keep-alive", "access-control-allow-origin": "*" });
-    const send = (o) => res.write("data: " + JSON.stringify(o) + "\n\n");
-    send({ id, object: "chat.completion.chunk", created, model, choices: [{ index: 0, delta: { role: "assistant" }, finish_reason: null }] });
-    send({ id, object: "chat.completion.chunk", created, model, choices: [{ index: 0, delta: {}, finish_reason: "error" }] });
+  trace(`${logTag} START-LIVE msgs=${wm.length} tools=${oaiDefs.length} full=${fullMode}`);
+  if (fullMode) {
+    let got;
+    try {
+      got = await getOAIText();
+    } catch (e) {
+      stats.errors++;
+      usage[tier].errors++;
+      release();
+      return openaiError(res, e.status && e.status < 500 ? e.status : 502, e.message);
+    }
+    const capped = applyMaxTokens(got.text, maxTokens);
+    if (capped.hit) trace(`${logTag} MAXTOKENS cut=${got.text.length}->${capped.text.length}`);
+    const ftext = capped.text;
+    const ffinish = capped.hit ? "length" : got.finish;
+    usage[tier].tokens += estTokens(ftext);
+    res.writeHead(200, {
+      "content-type": "text/event-stream",
+      "cache-control": "no-cache",
+      connection: "keep-alive",
+      "access-control-allow-origin": "*",
+    });
+    const fsend = (obj) => res.write("data: " + JSON.stringify(obj) + "\n\n");
+    fsend({ id, object: "chat.completion.chunk", created, model, choices: [{ index: 0, delta: { role: "assistant" }, finish_reason: null }] });
+    const CH = 48;
+    for (let i = 0; i < ftext.length; i += CH) {
+      fsend({ id, object: "chat.completion.chunk", created, model, choices: [{ index: 0, delta: { content: ftext.slice(i, i + CH) }, finish_reason: null }] });
+    }
+    fsend({ id, object: "chat.completion.chunk", created, model, choices: [{ index: 0, delta: {}, finish_reason: ffinish }] });
     res.write("data: [DONE]\n\n");
+    trace(`${logTag} SERVED-FULL chars=${ftext.length} finish=${ffinish} elapsed=${Date.now() - t0}ms`);
+    release();
     return res.end();
   }
-  // Fallback JSON: el worker devuelve no-stream íntegro y estable.
-  // Si el SSE quedó incompleto, siempre pedirlo y quedarse con el mejor.
-  let finishReason = result.complete ? "stop" : "length";
-  if (!result.complete) {
-    try {
-      trace(`${logTag} FALLBACK-JSON charsSoFar=${result.text.length}`);
-      const ju = await callUpstream({ messages: wm, modelId: model, stream: false, thinking, deepSearch, signal: null });
-      const jtext = await readWorkerJson(ju);
-      if (jtext.length >= result.text.length && jtext.length > 0) {
-        result = { text: jtext, attempts: result.attempts + 1, complete: true, aborted: false };
-        finishReason = "stop";
-        trace(`${logTag} FALLBACK-OK chars=${jtext.length}`);
-      } else {
-        trace(`${logTag} FALLBACK-SHORTER json=${jtext.length} keep=${result.text.length}`);
-      }
-    } catch (e) {
-      trace(`${logTag} FALLBACK-FAIL err=${e.message}`);
-    }
-  }
-  // Puente tool-use en stream (centralizado: EXEC -> shell-block -> retry).
-  const tcS = oaiDefs.length ? await resolveToolCall(result.text, oaiDefs, wm, model, logTag) : null;
-  if (tcS) {
-    finishReason = "tool_calls";
-    trace(`${logTag} TOOL-CALL name=${tcS.name}`);
-  }
-
   res.writeHead(200, {
     "content-type": "text/event-stream",
     "cache-control": "no-cache",
@@ -480,30 +581,114 @@ async function handleChatCompletions(req, res, body) {
   let closed = false;
   req.on("close", () => { closed = true; });
   send({ id, object: "chat.completion.chunk", created, model, choices: [{ index: 0, delta: { role: "assistant" }, finish_reason: null }] });
-  if (tcS) {
-    // Emisión tool_calls: prefijo como texto + llamada completa.
-    const tcId = "call_" + rid().slice(0, 20);
-    if (tcS.prefixText && !closed) {
-      send({ id, object: "chat.completion.chunk", created, model, choices: [{ index: 0, delta: { content: tcS.prefixText }, finish_reason: null }] });
+
+  let emitted = "";
+  let complete = false;
+  let attempts = 0;
+  let cappedHit = false;
+  const maxChars = Math.floor(maxTokens * 4);
+  const ctrl = new AbortController();
+  req.on("close", () => { try { ctrl.abort(); } catch {} });
+  const emitNovel = (novel) => {
+    if (!novel || closed) return;
+    let piece = novel;
+    if (emitted.length + piece.length > maxChars) {
+      piece = piece.slice(0, Math.max(0, maxChars - emitted.length));
+      cappedHit = true;
     }
-    if (!closed) {
-      send({ id, object: "chat.completion.chunk", created, model, choices: [{ index: 0, delta: { tool_calls: [{ index: 0, id: tcId, type: "function", function: { name: tcS.name, arguments: tcS.args } }] }, finish_reason: null }] });
-      send({ id, object: "chat.completion.chunk", created, model, choices: [{ index: 0, delta: {}, finish_reason: "tool_calls" }] });
-      res.write("data: [DONE]\n\n");
+    if (piece) {
+      emitted += piece;
+      send({ id, object: "chat.completion.chunk", created, model, choices: [{ index: 0, delta: { content: piece }, finish_reason: null }] });
     }
-    trace(`${logTag} SERVED-FC name=${tcS.name} elapsed=${Date.now() - t0}ms`);
-    return res.end();
-  }
-  // Re-emitir en trozos pequeños para preservar UX de streaming.
-  const CH = 24;
-  for (let i = 0; i < result.text.length && !closed; i += CH) {
-    send({ id, object: "chat.completion.chunk", created, model, choices: [{ index: 0, delta: { content: result.text.slice(i, i + CH) }, finish_reason: null }] });
+    if (cappedHit) { try { ctrl.abort(); } catch {} }
+  };
+  for (let a = 0; a <= MAX_RETRIES && !closed; a++) {
+    attempts = a + 1;
+    let upstream;
+    try {
+      upstream = await callUpstream({ messages: wm, modelId: model, stream: true, thinking, deepSearch, signal: ctrl.signal });
+    } catch (e) {
+      if (emitted || a === MAX_RETRIES) {
+        if (!closed && !emitted) send({ id, object: "chat.completion.chunk", created, model, choices: [{ index: 0, delta: {}, finish_reason: "error" }] });
+        break;
+      }
+      stats.retries++;
+      trace(`${logTag} LIVE upstream-error attempt=${attempts} err=${e.message}`);
+      await sleep(RETRY_BASE_MS * (a + 1));
+      continue;
+    }
+    let chunk;
+    let diverged = false;
+    try {
+      // Emite solo lo NUEVO. Si el reintento regenera otra historia
+      // (sin solapamiento con lo emitido), NO se pega Frankenstein:
+      // se cierra honesto con length.
+      let fresh = "";
+      chunk = await readWorkerSSELive(upstream, async (piece) => {
+        if (closed || diverged) return;
+        fresh += piece;
+        const merged = dedupeAppend(emitted, fresh);
+        if (!merged.startsWith(emitted)) { diverged = true; return; }
+        const novel = merged.slice(emitted.length);
+        if (novel) {
+          const before = emitted.length;
+          emitNovel(novel);
+          fresh = fresh.slice(emitted.length - before) || fresh;
+          if (cappedHit) { diverged = true; complete = true; }
+        }
+      }, ctrl.signal);
+      if (diverged) {
+        stats.truncatedUpstream++;
+        trace(`${logTag} LIVE DIVERGED emitted=${emitted.length} -> close honest`);
+        break;
+      }
+    } catch (e) {
+      if (emitted || a === MAX_RETRIES) break;
+      stats.retries++;
+      trace(`${logTag} LIVE read-error attempt=${attempts} err=${e.message}`);
+      await sleep(RETRY_BASE_MS * (a + 1));
+      continue;
+    }
+    if (ctrl.signal.aborted || closed) break;
+    if (chunk.done) {
+      // Drena resto no emitido (caso borde) y cierra como nativa.
+      const rest = dedupeAppend(emitted, chunk.text).slice(emitted.length);
+      if (rest && !closed) emitNovel(rest);
+      complete = !cappedHit;
+      break;
+    }
+    stats.truncatedUpstream++;
+    if (!emitted) {
+      // Nada emitido: reintento seguro.
+      trace(`${logTag} LIVE TRUNCATED attempt=${attempts} nothing-emitted -> retry`);
+      stats.retries++;
+      if (a < MAX_RETRIES) await sleep(RETRY_BASE_MS * (a + 1));
+      continue;
+    }
+    trace(`${logTag} LIVE TRUNCATED attempt=${attempts} emitted=${emitted.length} -> close honest`);
+    break;
   }
   if (!closed) {
-    send({ id, object: "chat.completion.chunk", created, model, choices: [{ index: 0, delta: {}, finish_reason: finishReason }] });
+    // Sin rescate por continuación: el worker reescribe el borde en vez
+    // de continuar (evidencia), así que cualquier pegado sería
+    // Frankenstein. Cierre honesto: complete->stop, corte->length,
+    // cap de max_tokens->length (como API nativa).
+    let finalReason = cappedHit ? "length" : (complete ? "stop" : "length");
+    // Puente tool-use post-stream (solo si el texto final trae EXEC).
+    const tcLive = oaiDefs.length ? parseToolCall(emitted, oaiDefs) : null;
+    if (tcLive) {
+      const tcId = "call_" + rid().slice(0, 20);
+      send({ id, object: "chat.completion.chunk", created, model, choices: [{ index: 0, delta: { tool_calls: [{ index: 0, id: tcId, type: "function", function: { name: tcLive.name, arguments: tcLive.args } }] }, finish_reason: null }] });
+      send({ id, object: "chat.completion.chunk", created, model, choices: [{ index: 0, delta: {}, finish_reason: "tool_calls" }] });
+      trace(`${logTag} LIVE TOOL-CALL name=${tcLive.name}`);
+    } else {
+      send({ id, object: "chat.completion.chunk", created, model, choices: [{ index: 0, delta: {}, finish_reason: finalReason }] });
+    }
     res.write("data: [DONE]\n\n");
   }
-  trace(`${logTag} SERVED chars=${result.text.length} attempts=${result.attempts} complete=${result.complete} elapsed=${Date.now() - t0}ms`);
+  usage[tier].tokens += estTokens(emitted);
+  trace(`${logTag} SERVED-LIVE chars=${emitted.length} attempts=${attempts} complete=${complete} elapsed=${Date.now() - t0}ms`);
+  release();
   res.end();
 }
 
@@ -694,6 +879,12 @@ async function resolveResponsesText(body, workerMessages, model, logTag) {
 
 async function handleResponses(req, res, body) {
   stats.requests++;
+  const tier = tierOf(req);
+  const limited = checkLimit(tier);
+  if (limited) { usage[tier].errors++; return limitResponse(res, limited); }
+  const release = takeSlot(tier);
+  body.__tier = tier;
+  body.__release = release;
   try {
     const keys = Object.keys(body || {});
     const nTools = Array.isArray(body.tools) ? body.tools.length : 0;
@@ -706,11 +897,12 @@ async function handleResponses(req, res, body) {
       trace(`RSP-INPUT-TYPES ${JSON.stringify(it)}`);
     } catch {}
   } catch {}
+  const done = (fn) => { try { body.__release(); } catch {} return fn(); };
   const model = stripPrefix(body.model);
   if (!MODEL_IDS.has(model)) {
-    return sendJson(res, 404, {
+    return done(() => sendJson(res, 404, {
       error: { message: `model '${body.model}' not found. Valid: ${[...MODEL_IDS].join(", ")}`, type: "invalid_request_error", code: "model_not_found" },
-    });
+    }));
   }
   let workerMessages = toWorkerMessagesResp(body.input);
   if (!workerMessages.length && Array.isArray(body.messages)) workerMessages = toWorkerMessagesOA(body.messages);
@@ -718,7 +910,7 @@ async function handleResponses(req, res, body) {
     workerMessages = [{ role: "system", content: body.instructions }, ...workerMessages];
   }
   if (!workerMessages.length) {
-    return sendJson(res, 400, { error: { message: "input (string|array) or messages required", type: "invalid_request_error", code: "bad_request" } });
+    return done(() => sendJson(res, 400, { error: { message: "input (string|array) or messages required", type: "invalid_request_error", code: "bad_request" } }));
   }
   const stream = body.stream === true;
   const respId = "resp_" + rid();
@@ -740,9 +932,15 @@ async function handleResponses(req, res, body) {
   try {
     resolved = await resolveResponsesText(body, workerMessages, model, logTag);
   } catch (e) {
-    return openaiError(res, 502, e.message);
+    return done(() => openaiError(res, 502, e.message));
   }
   const { result, status } = resolved;
+  // Límite profesional Responses: max_output_tokens ?? max_tokens.
+  const rspMax = Number(body.max_output_tokens ?? body.max_tokens) || 4096;
+  const rspCap = applyMaxTokens(result.text, rspMax);
+  if (rspCap.hit) trace(`${logTag} MAXTOKENS cut=${result.text.length}->${rspCap.text.length}`);
+  result.text = rspCap.text;
+  const rspStatus = rspCap.hit ? "incomplete" : status;
   const outputTokens = estTokens(result.text);
   // Puente agéntico centralizado (EXEC -> shell-block -> reintento).
   const toolCall = fnTools.length ? await resolveToolCall(result.text, fnTools, workerMessages, model, logTag) : null;
@@ -765,17 +963,19 @@ async function handleResponses(req, res, body) {
     trace(`${logTag} TOOL-CALL name=${toolCall.name} args=${toolCall.args.slice(0, 200)}`);
   } else {
     outputItems = [{
-      type: "message", id: "msg_" + rid(), status: status === "completed" ? "completed" : "incomplete",
+      type: "message", id: "msg_" + rid(), status: rspStatus === "completed" ? "completed" : "incomplete",
       role: "assistant", content: [{ type: "output_text", text: result.text, annotations: [] }],
     }];
   }
   const outputItem = outputItems[outputItems.length - 1];
 
   if (!stream) {
-    trace(`${logTag} SERVED chars=${result.text.length} status=${status} toolCall=${toolCall ? toolCall.name : "-"} elapsed=${Date.now() - t0}ms`);
+    usage[body.__tier].tokens += estTokens(result.text);
+  trace(`${logTag} SERVED chars=${result.text.length} status=${rspStatus} toolCall=${toolCall ? toolCall.name : "-"} elapsed=${Date.now() - t0}ms`);
+  try { body.__release(); } catch {}
     return sendJson(res, 200, {
       id: respId, object: "response", created, model,
-      status, output: outputItems, parallel_tool_calls: true, tool_choice: "auto", tools: [],
+      status: rspStatus, output: outputItems, parallel_tool_calls: true, tool_choice: "auto", tools: [],
       usage: { input_tokens: inputTokens, output_tokens: outputTokens, total_tokens: inputTokens + outputTokens },
     });
   }
@@ -825,7 +1025,9 @@ async function handleResponses(req, res, body) {
         },
       });
     }
-    trace(`${logTag} SERVED-FC name=${fcItem.name} elapsed=${Date.now() - t0}ms`);
+    usage[body.__tier].tokens += estTokens(result.text);
+  trace(`${logTag} SERVED-FC name=${fcItem.name} elapsed=${Date.now() - t0}ms`);
+  try { body.__release(); } catch {}
     return res.end();
   }
   if (!closed) {
@@ -850,25 +1052,35 @@ async function handleResponses(req, res, body) {
       },
     });
   }
-  trace(`${logTag} SERVED chars=${result.text.length} status=${status} elapsed=${Date.now() - t0}ms`);
+  usage[body.__tier].tokens += estTokens(result.text);
+  trace(`${logTag} SERVED chars=${result.text.length} status=${rspStatus} elapsed=${Date.now() - t0}ms`);
+  try { body.__release(); } catch {}
   res.end();
 }
 
 async function handleMessages(req, res, body) {
   stats.requests++;
+  const tier = tierOf(req);
+  const limited = checkLimit(tier);
+  if (limited) { usage[tier].errors++; return limitResponse(res, limited); }
+  const release = takeSlot(tier);
   const model = stripPrefix(body.model);
   if (!MODEL_IDS.has(model)) {
+    release();
     return anthropicError(res, 404, `model '${body.model}' not found. Valid: ${[...MODEL_IDS].join(", ")}`);
   }
   const maxTokens = Number(body.max_tokens) || 1024;
   const workerMessages = toWorkerMessagesAnt(body.system, body.messages);
-  if (!workerMessages.length) return anthropicError(res, 400, "messages required");
+  if (!workerMessages.length) { release(); return anthropicError(res, 400, "messages required"); }
   const stream = body.stream === true;
+  // Thinking Anthropic -> flag del worker. El worker razona en el texto;
+  // FMP no fabrica bloques thinking (ver /health.thinking).
+  const thinking = body.thinking !== undefined ? !!body.thinking : true;
 
   const msgId = "msg_" + rid();
   const inputTokens = estTokens(JSON.stringify(workerMessages));
   const logTag = `ANT/${model}/${msgId.slice(-6)}`;
-  void maxTokens;
+  // Límite profesional (igual que OAI): worker ignora max_tokens.
 
   // Puente tool-use Anthropic: tools [{name, description, input_schema}].
   const antTools = Array.isArray(body.tools) ? body.tools : [];
@@ -882,57 +1094,98 @@ async function handleMessages(req, res, body) {
   }
 
   const t0 = Date.now();
-  trace(`${logTag} START msgs=${wmAnt.length} stream=${stream} tools=${antDefs.length}`);
-  let result;
-  try {
-    result = await fetchCompleteText({ messages: wmAnt, modelId: model, thinking: false, deepSearch: false, signal: null, logTag });
-  } catch (e) {
-    stats.errors++;
-    return anthropicError(res, 502, e.message);
-  }
-  // Fallback JSON si el SSE quedó incompleto (mismo criterio que ruta OpenAI).
-  let antStop = result.complete ? "end_turn" : "max_tokens";
-  if (!result.complete) {
+  trace(`${logTag} START-LIVE stream=${stream} tools=${antDefs.length} thinking=${thinking}`);
+  const fullMode = body.stream_mode === "full";
+  if (fullMode && stream) {
+    let got;
     try {
-      trace(`${logTag} FALLBACK-JSON charsSoFar=${result.text.length}`);
-      const ju = await callUpstream({ messages: wmAnt, modelId: model, stream: false, thinking: false, deepSearch: false, signal: null });
-      const jtext = await readWorkerJson(ju);
-      if (jtext.length >= result.text.length && jtext.length > 0) {
-        result = { text: jtext, attempts: result.attempts + 1, complete: true, aborted: false };
-        antStop = "end_turn";
-        trace(`${logTag} FALLBACK-OK chars=${jtext.length}`);
-      } else {
-        trace(`${logTag} FALLBACK-SHORTER json=${jtext.length} keep=${result.text.length}`);
-      }
+      const r = await fetchCompleteText({ messages: wmAnt, modelId: model, thinking, deepSearch: false, signal: null, logTag });
+      got = r.complete ? r.text : (await (async () => {
+        try {
+          const ju = await callUpstream({ messages: wmAnt, modelId: model, stream: false, thinking, deepSearch: false, signal: null });
+          const jt = await readWorkerJson(ju);
+          return jt.length >= r.text.length && jt.length > 0 ? jt : r.text;
+        } catch { return r.text; }
+      })());
     } catch (e) {
-      trace(`${logTag} FALLBACK-FAIL err=${e.message}`);
+      stats.errors++;
+      usage[tier].errors++;
+      release();
+      return anthropicError(res, 502, e.message);
     }
-  }
-  // Puente: EXEC/shell-block/retry centralizado.
-  const tcAnt = antDefs.length && !antDisabled ? await resolveToolCall(result.text, antDefs, wmAnt, model, logTag) : null;
-  let antContent;
-  if (tcAnt) {
-    let input = {};
-    try { input = JSON.parse(tcAnt.args); } catch { input = {}; }
-    antContent = [];
-    if (tcAnt.prefixText) antContent.push({ type: "text", text: tcAnt.prefixText });
-    antContent.push({ type: "tool_use", id: "toolu_" + rid().slice(0, 20), name: tcAnt.name, input });
-    antStop = "tool_use";
-    trace(`${logTag} TOOL-CALL name=${tcAnt.name}`);
-  } else {
-    antContent = [{ type: "text", text: result.text }];
+    const capped = applyMaxTokens(got, maxTokens);
+    if (capped.hit) trace(`${logTag} MAXTOKENS cut=${got.length}->${capped.text.length}`);
+    const ftext = capped.hit ? capped.text : got;
+    const fstop = capped.hit ? "max_tokens" : "end_turn";
+    usage[tier].tokens += estTokens(ftext);
+    res.writeHead(200, {
+      "content-type": "text/event-stream",
+      "cache-control": "no-cache",
+      connection: "keep-alive",
+      "access-control-allow-origin": "*",
+    });
+    const fsend = (obj) => res.write("event: " + obj._ev + "\ndata: " + JSON.stringify(obj._d) + "\n\n");
+    const fev = (name, d) => ({ _ev: name, _d: d });
+    fsend(fev("message_start", { type: "message_start", message: { id: msgId, type: "message", role: "assistant", model, content: [], stop_reason: null, stop_sequence: null, usage: { input_tokens: inputTokens, output_tokens: 1 } } }));
+    fsend(fev("content_block_start", { type: "content_block_start", index: 0, content_block: { type: "text", text: "" } }));
+    const CH = 48;
+    for (let i = 0; i < ftext.length; i += CH) {
+      fsend(fev("content_block_delta", { type: "content_block_delta", index: 0, delta: { type: "text_delta", text: ftext.slice(i, i + CH) } }));
+    }
+    fsend(fev("content_block_stop", { type: "content_block_stop", index: 0 }));
+    fsend(fev("message_delta", { type: "message_delta", delta: { stop_reason: fstop, stop_sequence: null }, usage: { output_tokens: estTokens(ftext) } }));
+    fsend(fev("message_stop", { type: "message_stop" }));
+    trace(`${logTag} SERVED-FULL chars=${ftext.length} stop=${fstop} elapsed=${Date.now() - t0}ms`);
+    release();
+    return res.end();
   }
 
   if (!stream) {
+    let got;
+    try {
+      const r = await fetchCompleteText({ messages: wmAnt, modelId: model, thinking, deepSearch: false, signal: null, logTag });
+      got = r.complete ? r.text : (await (async () => {
+        try {
+          const ju = await callUpstream({ messages: wmAnt, modelId: model, stream: false, thinking, deepSearch: false, signal: null });
+          const jt = await readWorkerJson(ju);
+          return jt.length >= r.text.length && jt.length > 0 ? jt : r.text;
+        } catch { return r.text; }
+      })());
+    } catch (e) {
+      stats.errors++;
+      usage[tier].errors++;
+      release();
+      return anthropicError(res, 502, e.message);
+    }
+    usage[tier].tokens += estTokens(got);
+    const cappedAnt = applyMaxTokens(got, maxTokens);
+    if (cappedAnt.hit) trace(`${logTag} MAXTOKENS cut=${got.length}->${cappedAnt.text.length}`);
+    got = cappedAnt.hit ? cappedAnt.text : got;
+    const tc0 = antDefs.length && !antDisabled ? await resolveToolCall(got, antDefs, wmAnt, model, logTag) : null;
+    let content0;
+    let stop0 = cappedAnt.hit ? "max_tokens" : "end_turn";
+    if (tc0) {
+      let input = {};
+      try { input = JSON.parse(tc0.args); } catch { input = {}; }
+      content0 = [];
+      if (tc0.prefixText) content0.push({ type: "text", text: tc0.prefixText });
+      content0.push({ type: "tool_use", id: "toolu_" + rid().slice(0, 20), name: tc0.name, input });
+      stop0 = "tool_use";
+      trace(`${logTag} TOOL-CALL name=${tc0.name}`);
+    } else {
+      content0 = [{ type: "text", text: got }];
+    }
+    release();
     return sendJson(res, 200, {
       id: msgId, type: "message", role: "assistant", model,
-      content: antContent,
-      stop_reason: antStop,
+      content: content0,
+      stop_reason: stop0,
       stop_sequence: null,
-      usage: { input_tokens: inputTokens, output_tokens: estTokens(result.text) },
+      usage: { input_tokens: inputTokens, output_tokens: estTokens(got) },
     });
   }
 
+  // STREAM EN VIVO Anthropic: text_delta en cuanto llega + resume.
   res.writeHead(200, {
     "content-type": "text/event-stream",
     "cache-control": "no-cache",
@@ -943,40 +1196,110 @@ async function handleMessages(req, res, body) {
   let closed = false;
   req.on("close", () => { closed = true; });
   const ev = (name, d) => ({ _ev: name, _d: d });
-  if (!closed) {
-    send(ev("message_start", { type: "message_start", message: { id: msgId, type: "message", role: "assistant", model, content: [], stop_reason: null, stop_sequence: null, usage: { input_tokens: inputTokens, output_tokens: 1 } } }));
-    let si = 0;
-    for (const b of antContent) {
-      if (b.type === "text") {
-        send(ev("content_block_start", { type: "content_block_start", index: si, content_block: { type: "text", text: "" } }));
-      } else {
-        send(ev("content_block_start", { type: "content_block_start", index: si, content_block: { type: "tool_use", id: b.id, name: b.name, input: {} } }));
+  send(ev("message_start", { type: "message_start", message: { id: msgId, type: "message", role: "assistant", model, content: [], stop_reason: null, stop_sequence: null, usage: { input_tokens: inputTokens, output_tokens: 1 } } }));
+  send(ev("content_block_start", { type: "content_block_start", index: 0, content_block: { type: "text", text: "" } }));
+
+  let emitted = "";
+  let complete = false;
+  let attempts = 0;
+  let cappedHit = false;
+  const maxChars = Math.floor(maxTokens * 4);
+  const ctrl = new AbortController();
+  req.on("close", () => { try { ctrl.abort(); } catch {} });
+  const emitAnt = (novel) => {
+    if (!novel || closed) return;
+    let piece = novel;
+    if (emitted.length + piece.length > maxChars) {
+      piece = piece.slice(0, Math.max(0, maxChars - emitted.length));
+      cappedHit = true;
+    }
+    if (piece) {
+      emitted += piece;
+      send(ev("content_block_delta", { type: "content_block_delta", index: 0, delta: { type: "text_delta", text: piece } }));
+    }
+    if (cappedHit) { try { ctrl.abort(); } catch {} }
+  };
+  for (let a = 0; a <= MAX_RETRIES && !closed; a++) {
+    attempts = a + 1;
+    let upstream;
+    try {
+      upstream = await callUpstream({ messages: wmAnt, modelId: model, stream: true, thinking, deepSearch: false, signal: ctrl.signal });
+    } catch (e) {
+      if (emitted || a === MAX_RETRIES) break;
+      stats.retries++;
+      trace(`${logTag} LIVE upstream-error attempt=${attempts} err=${e.message}`);
+      await sleep(RETRY_BASE_MS * (a + 1));
+      continue;
+    }
+    let diverged = false;
+    try {
+      let fresh = "";
+      const chunk = await readWorkerSSELive(upstream, async (piece) => {
+        if (closed || diverged) return;
+        fresh += piece;
+        const merged = dedupeAppend(emitted, fresh);
+        if (!merged.startsWith(emitted)) { diverged = true; return; }
+        const novel = merged.slice(emitted.length);
+        if (novel) {
+          const before = emitted.length;
+          emitAnt(novel);
+          fresh = fresh.slice(emitted.length - before) || fresh;
+          if (cappedHit) { diverged = true; complete = true; }
+        }
+      }, ctrl.signal);
+      if (diverged) {
+        stats.truncatedUpstream++;
+        trace(`${logTag} LIVE DIVERGED emitted=${emitted.length} -> close honest`);
+        break;
       }
-      si++;
+      if (ctrl.signal.aborted || closed) break;
+      if (chunk.done) {
+        const rest = dedupeAppend(emitted, chunk.text).slice(emitted.length);
+        if (rest && !closed) emitAnt(rest);
+        complete = !cappedHit;
+        break;
+      }
+      stats.truncatedUpstream++;
+      if (!emitted) {
+        trace(`${logTag} LIVE TRUNCATED attempt=${attempts} nothing-emitted -> retry`);
+        stats.retries++;
+        if (a < MAX_RETRIES) await sleep(RETRY_BASE_MS * (a + 1));
+        continue;
+      }
+      trace(`${logTag} LIVE TRUNCATED attempt=${attempts} emitted=${emitted.length} -> close honest`);
+      break;
+    } catch (e) {
+      if (emitted || a === MAX_RETRIES) break;
+      stats.retries++;
+      trace(`${logTag} LIVE read-error attempt=${attempts} err=${e.message}`);
+      await sleep(RETRY_BASE_MS * (a + 1));
     }
   }
-  let bi = 0;
-  for (const b of antContent) {
-    if (closed) break;
-    if (b.type === "text") {
-      const CH = 24;
-      for (let i = 0; i < b.text.length && !closed; i += CH) {
-        send(ev("content_block_delta", { type: "content_block_delta", index: bi, delta: { type: "text_delta", text: b.text.slice(i, i + CH) } }));
-      }
-      if (!closed) send(ev("content_block_stop", { type: "content_block_stop", index: bi }));
+  if (!closed) {
+    // Sin rescate por continuación (ver nota OAI): cierre honesto.
+    // Cap de max_tokens -> max_tokens (como API nativa).
+    let antFinal = cappedHit ? "max_tokens" : (complete ? "end_turn" : "max_tokens");
+    // Puente tool-use post-stream (solo EXEC explícito: el texto ya salió).
+    const tcLive = antDefs.length && !antDisabled ? parseToolCall(emitted, antDefs) : null;
+    if (tcLive) {
+      let input = {};
+      try { input = JSON.parse(tcLive.args); } catch { input = {}; }
+      const tuId = "toolu_" + rid().slice(0, 20);
+      send(ev("content_block_stop", { type: "content_block_stop", index: 0 }));
+      send(ev("content_block_start", { type: "content_block_start", index: 1, content_block: { type: "tool_use", id: tuId, name: tcLive.name, input: {} } }));
+      send(ev("content_block_delta", { type: "content_block_delta", index: 1, delta: { type: "input_json_delta", partial_json: JSON.stringify(input) } }));
+      send(ev("content_block_stop", { type: "content_block_stop", index: 1 }));
+      send(ev("message_delta", { type: "message_delta", delta: { stop_reason: "tool_use", stop_sequence: null }, usage: { output_tokens: estTokens(emitted) } }));
+      trace(`${logTag} LIVE TOOL-CALL name=${tcLive.name}`);
     } else {
-      if (!closed) {
-        send(ev("content_block_delta", { type: "content_block_delta", index: bi, delta: { type: "input_json_delta", partial_json: JSON.stringify(b.input) } }));
-        send(ev("content_block_stop", { type: "content_block_stop", index: bi }));
-      }
+      send(ev("content_block_stop", { type: "content_block_stop", index: 0 }));
+      send(ev("message_delta", { type: "message_delta", delta: { stop_reason: antFinal, stop_sequence: null }, usage: { output_tokens: estTokens(emitted) } }));
     }
-    bi++;
-  }
-  if (!closed) {
-    send(ev("message_delta", { type: "message_delta", delta: { stop_reason: antStop, stop_sequence: null }, usage: { output_tokens: estTokens(result.text) } }));
     send(ev("message_stop", { type: "message_stop" }));
   }
-  trace(`${logTag} SERVED chars=${result.text.length} attempts=${result.attempts} complete=${result.complete} elapsed=${Date.now() - t0}ms`);
+  usage[tier].tokens += estTokens(emitted);
+  trace(`${logTag} SERVED-LIVE chars=${emitted.length} attempts=${attempts} complete=${complete} elapsed=${Date.now() - t0}ms`);
+  release();
   res.end();
 }
 
@@ -991,6 +1314,7 @@ const server = http.createServer(async (req, res) => {
     }
     if (req.method === "GET" && (path === "/health" || path === "/")) return handleHealth(res);
     if (req.method === "GET" && (path === "/v1/models" || path === "/models")) return handleModels(res);
+    if (req.method === "GET" && (path === "/v1/usage" || path === "/usage")) return handleUsage(res);
 
     if (req.method === "POST" && (path === "/v1/chat/completions" || path === "/chat/completions")) {
       let body;
