@@ -77,6 +77,7 @@ aprobación antes de ejecutar: no hay ejecución ciega.
 | `FMP_MAX_RETRIES` | `5` | reintentos (solo si nada emitido) |
 | `FMP_RETRY_BASE_MS` | `1500` | backoff lineal base |
 | `FMP_KEYS` | vacío (todo `local`, sin límite) | `key:tier,key2:tier` |
+| `FMP_MAX_TOKENS_CEIL` | `8192` | techo: FMP nunca emite más aunque el cliente pida más |
 | `FMP_FREE_RPM` / `FMP_FREE_CONC` | `10` / `2` | límite tier free |
 | `FMP_PRO_RPM` / `FMP_PRO_CONC` | `120` / `16` | límite tier pro |
 | `FMP_TRACE` (`SHIM_TRACE`) | vacío | archivo de trace (debug) |

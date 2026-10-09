@@ -36,6 +36,16 @@ const MAX_BODY_BYTES = 10 * 1024 * 1024;
 const MAX_RETRIES = Number(process.env.FMP_MAX_RETRIES || 5);
 const RETRY_BASE_MS = Number(process.env.FMP_RETRY_BASE_MS || 1500);
 const TRACE_FILE = process.env.SHIM_TRACE || process.env.FMP_TRACE || "";
+// Techo profesional: aunque el cliente pida más, FMP nunca emite más de
+// este tope (protege al agente de blowups de 64k/128k). Default 8192.
+const MAX_TOKENS_CEIL = Number(process.env.FMP_MAX_TOKENS_CEIL || 8192);
+// Normaliza el max pedido: default por ruta, respeta cliente, aplica techo.
+function effMaxTokens(requested, routeDefault) {
+  const dflt = Number(routeDefault) || 4096;
+  let v = Number(requested);
+  if (!v || v <= 0) v = dflt;
+  return Math.min(v, MAX_TOKENS_CEIL);
+}
 
 // ---- Plan premium: tiers, rate-limit, cola ----
 // Tiers por API key (Authorization: Bearer <key> o x-api-key).
@@ -453,7 +463,7 @@ async function handleChatCompletions(req, res, body) {
   const deepSearch = !!(body.deepSearch ?? body.deep_search);
   // Límite profesional: el worker ignora max_tokens; FMP trunca y avisa
   // con finish length (igual que API nativa). Default 4096.
-  const maxTokens = Number(body.max_tokens ?? body.max_completion_tokens) || 4096;
+  const maxTokens = effMaxTokens(body.max_tokens ?? body.max_completion_tokens, 4096);
   // stream_mode full: bufferiza íntegro y luego emite SSE (para rachas
   // malas de upstream). Default live, como API nativa.
   const fullMode = body.stream_mode === "full";
@@ -936,7 +946,7 @@ async function handleResponses(req, res, body) {
   }
   const { result, status } = resolved;
   // Límite profesional Responses: max_output_tokens ?? max_tokens.
-  const rspMax = Number(body.max_output_tokens ?? body.max_tokens) || 4096;
+  const rspMax = effMaxTokens(body.max_output_tokens ?? body.max_tokens, 4096);
   const rspCap = applyMaxTokens(result.text, rspMax);
   if (rspCap.hit) trace(`${logTag} MAXTOKENS cut=${result.text.length}->${rspCap.text.length}`);
   result.text = rspCap.text;
@@ -1069,7 +1079,7 @@ async function handleMessages(req, res, body) {
     release();
     return anthropicError(res, 404, `model '${body.model}' not found. Valid: ${[...MODEL_IDS].join(", ")}`);
   }
-  const maxTokens = Number(body.max_tokens) || 1024;
+  const maxTokens = effMaxTokens(body.max_tokens, 1024);
   const workerMessages = toWorkerMessagesAnt(body.system, body.messages);
   if (!workerMessages.length) { release(); return anthropicError(res, 400, "messages required"); }
   const stream = body.stream === true;
