@@ -1,0 +1,31 @@
+# FMP configuration reference (YAML form of .env.example).
+# Environment variables take precedence when both are present.
+# Copy to config.yaml for reference only — FMP reads env / .env, not this file.
+fmp:
+  host: "127.0.0.1"          # localhost-only default
+  port: 2089
+  allow_public_bind: false    # explicit override + warning required otherwise
+
+  auth_mode: "api_key"        # api_key | none
+  api_keys: []                # empty = local-open mode (localhost only)
+
+  log_level: "info"           # debug | info | warn | error
+  log_prompts: false          # never true with sensitive data
+
+  rate_limit_rpm: 30          # 0 disables global limiter
+  max_request_bytes: 10485760
+  max_retries: 5
+  upstream_timeout_ms: 120000
+
+  enable_openai: true
+  enable_anthropic: true
+  enable_responses: false     # experimental, off by default
+
+  tool_mode: "transport_only" # ONLY supported value; FMP never executes tools
+
+  disabled_models: []         # alias kill switch, e.g. ["sol"]
+  kill_all: false             # global kill switch -> 503 on all inference
+
+  cors_allow_origins: []      # empty = deny (no ACAO header)
+
+  upstream: "https://freemodels-chat.freemodels.workers.dev"

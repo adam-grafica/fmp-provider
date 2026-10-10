@@ -1,95 +1,102 @@
-# FMP — FreeModels Provider (v2.1.0)
+# FMP — Private Development Inference Adapter (v2.2.0)
 
-Proveedor local OpenAI-compatible + Anthropic-compatible + Responses API
-sobre el worker de `freemodels.pro`. Sin dependencias (solo Node 18+).
+FMP is a private experimental inference adapter.
+Upstream model labels are declared by upstream and not independently
+verified.
+FMP does not execute tools, commands or host actions.
+Clients/harnesses own tool execution and permissions.
+Default deployment is localhost-only.
+Do not send secrets or sensitive data to unverified upstreams.
 
-## Qué ofrece
+FMP normalizes OpenAI Chat Completions + Anthropic Messages over a
+configured upstream worker and streams normalized responses. No
+dependencies (Node 18+ only).
 
-- **Streaming en vivo real**: pass-through inmediato, TTFB ~3ms. Sin
-  buffer total: ves los tokens llegar como en una API nativa.
-- **Cierre honesto**: el worker upstream corta el SSE sin `data: [DONE]`
-  de forma intermitente. FMP reintenta cuando nada se emitió y cierra
-  con `length`/`max_tokens` cuando ya salió texto (sin Frankenstein).
-- **`stream_mode: full`**: bufferiza íntegro vía pipeline con retry +
-  fallback JSON y luego emite SSE (para rachas malas de upstream).
-- **Límite `max_tokens` real**: el worker lo ignora; FMP trunca y avisa
-  con `length`/`max_tokens`/`incomplete` (igual que API nativa).
-  Default 4096 en chat, 1024 en messages ( Anthropic exige el campo).
-- **Tool-use nativo** en las 3 rutas (puente `EXEC:::<tool> ARGS <json>`
-  con 3 niveles: EXEC → bloque shell → reintento dirigido).
-- **Plan premium**: tiers `free`/`pro` por API key, rate-limit
-  (rpm + concurrencia), `429` con `retry-after`, métricas en
-  `/health` y `GET /v1/usage`.
-- **Thinking honesto**: el worker NO expone canal thinking separado
-  (verificado en bundle + SSE). `thinking:true` se reenvía y el modelo
-  razona paso a paso en el texto. FMP no fabrica bloques thinking.
+## Status
 
-## Uso
+```text
+FMP v2.2.0 — PRIVATE DEVELOPMENT READY
+Linux: LOCALHOST / 9Router READY
+Windows: LOCAL INSTALLATION READY
+Production: NOT AUTHORIZED — public exposure NOT AUTHORIZED,
+sensitive data NOT AUTHORIZED.
+```
+
+## Quick start (localhost)
 
 ```bash
-node server.js                    # 127.0.0.1:2089
-PORT=2089 HOST=127.0.0.1 FMP_MAX_RETRIES=5 node server.js
-# Premium: FMP_KEYS="sk-x:free,sk-y:pro" FMP_FREE_RPM=10 FMP_PRO_RPM=120
+cp .env.example .env      # set FMP_API_KEYS for any shared use
+node bin/fmp.js doctor    # validate config, exit non-zero on failure
+node server.js            # 127.0.0.1:2089
+node bin/fmp.js health && node bin/fmp.js models
 ```
 
 ## Endpoints
 
-| Método | Ruta | Notas |
-|---|---|---|
-| GET | `/health`, `/` | estado + `stats` + `tiers` + modelos |
-| GET | `/v1/models`, `/models` | 8 modelos |
-| GET | `/v1/usage`, `/usage` | métricas por tier |
-| POST | `/v1/chat/completions` | OpenAI, `stream` + `stream_mode: full` |
-| POST | `/v1/messages` | Anthropic, `stream` + `stream_mode: full` |
-| POST | `/v1/responses` | Responses API (Codex), `stream` |
+| Method | Route | Auth | Notes |
+|---|---|---|---|
+| GET | `/health`, `/` | no | status `healthy/degraded/unavailable` + versions + routes |
+| GET | `/stats`, `/v1/stats` | key* | request/error/retry counters |
+| GET | `/v1/models`, `/models` | key* | 8 aliases, `verified_identity: unknown` |
+| GET | `/v1/usage`, `/usage` | key* | tier metrics (legacy tiers) |
+| POST | `/v1/chat/completions` | key* | OpenAI, stream + `stream_mode: full` |
+| POST | `/v1/messages` | key* | Anthropic, stream + `stream_mode: full` |
+| POST | `/v1/responses` | key* | DISABLED by default (experimental) |
 
-`model` acepta id pelado (`sol`) o con prefijo 9Router (`fmp-oai/sol`).
+\* key = required only when `FMP_API_KEYS` is configured; health stays public.
 
-## Puente agéntico (tools)
+`model` must be explicit (no ambient fallback): bare id (`sol`) or
+9Router-prefixed (`fmp-oai/sol`, prefix stripped). Unknown alias → 404,
+disabled/killed alias → 503, missing → 400. Every inference response
+carries sanitized `_meta: { alias, route, declared_identity,
+verified_identity: "unknown" }`.
 
-Codex manda ~20 tools y espera `function_call`. El worker no habla
-Responses nativo, así que FMP traduce:
+## Configuration
 
-1. Inyecta catálogo de tools como prompt sistema, protocolo `EXEC:::<tool> ARGS <json>`.
-2. Convierte `EXEC:::` a `function_call` / `tool_calls` / `tool_use` nativos.
-3. Fallbacks: primer bloque shell del texto → `exec_command`; reintento
-   dirigido que pide SOLO el bloque.
-4. Rondas `function_call_output` / `role: tool` / `tool_result` se mapean
-   a mensajes del worker para continuar la conversación agéntica.
+See `.env.example` + `config.example.yaml` + `docs/`:
 
-Límite conocido: con el contexto completo de Codex (20 tools +
-environment con mención a sandbox), el worker a veces se niega a emitir
-EXEC; el puente convierte cuando el worker coopera. Codex pide
-aprobación antes de ejecutar: no hay ejecución ciega.
+- `FMP_HOST` default `127.0.0.1`; non-localhost bind refuses startup
+  unless `FMP_ALLOW_PUBLIC_BIND=true` (warning printed).
+- `FMP_AUTH_MODE=api_key` default; `FMP_API_KEYS` empty = local-open
+  mode (localhost only).
+- `FMP_TOOL_MODE=transport_only` — the only accepted value.
+- Kill switch: `FMP_DISABLED_MODELS=sol,terra` or `FMP_KILL_ALL=true`.
+- `docs/architecture.md`, `docs/security.md`,
+  `docs/openai-compatibility.md`, `docs/anthropic-compatibility.md`,
+  `docs/tool-transport.md`, `docs/windows-setup.md`,
+  `docs/linux-setup.md`, `docs/troubleshooting.md`.
 
-## Modelos (8)
-
-`claude-opus-5.5`, `claude-sonnet-5`, `claude-fable-5`, `claude-fable-5.1`,
-`sol`, `terra`, `glm-5.2`, `kimi-k3`
-
-## Variables
-
-| Var | Default | Qué hace |
-|---|---|---|
-| `PORT` / `HOST` | `2089` / `127.0.0.1` | bind |
-| `FMP_UPSTREAM` | worker freemodels | override upstream |
-| `FMP_TIMEOUT_MS` | `120000` | timeout por intento |
-| `FMP_MAX_RETRIES` | `5` | reintentos (solo si nada emitido) |
-| `FMP_RETRY_BASE_MS` | `1500` | backoff lineal base |
-| `FMP_KEYS` | vacío (todo `local`, sin límite) | `key:tier,key2:tier` |
-| `FMP_MAX_TOKENS_CEIL` | `8192` | techo: FMP nunca emite más aunque el cliente pida más |
-| `FMP_FREE_RPM` / `FMP_FREE_CONC` | `10` / `2` | límite tier free |
-| `FMP_PRO_RPM` / `FMP_PRO_CONC` | `120` / `16` | límite tier pro |
-| `FMP_TRACE` (`SHIM_TRACE`) | vacío | archivo de trace (debug) |
-
-## Registro en 9Router
+## CLI
 
 ```bash
-./register-9router.sh   # crea nodos fmp-oai + fmp-ant si faltan, backup sqlite
+node bin/fmp.js doctor            # config validation + safe summary
+node bin/fmp.js health            # GET /health, exit 1 on failure
+node bin/fmp.js models            # alias catalog (needs FMP_API_KEY if gated)
+node bin/fmp.js verify            # live contract checks (no secrets)
+node bin/fmp.js config validate   # validate only
+# append --json for machine-readable output
 ```
 
-## Verificación
+## Install
+
+- Linux: `./install.sh` (systemd unit `fmp-provider.service` OPTIONAL,
+  server use only — not needed for local dev).
+- Windows: `.\install.ps1` (no admin, no services).
+- Docker: `docker compose up --build` (loopback-bound).
+- Uninstall/rollback in each script header. Never touches the running
+  production service.
+
+## Tests
 
 ```bash
-./verify.sh   # health + models + live/stream/full + caps + tool-use + tiers
+npm test   # node --test, fixtures only, no network/secrets
 ```
+
+31 tests: chat/stream both routes, retry, JSON fallback, auth gate,
+rate limit, kill switch, tool transport both routes, malformed
+schemas, redaction, graceful shutdown, config validation, catalog.
+
+## Versioning
+
+`CHANGELOG.md` tracks releases. Current: v2.2.0 private development
+ready. No release published by this task; no production routing.

@@ -1,0 +1,14 @@
+# FMP local development stack. Loopback-bound; no public ports.
+# Usage: cp .env.example .env && docker compose up --build
+services:
+  fmp:
+    build: .
+    image: fmp-provider:2.2.0
+    env_file:
+      - .env
+    ports:
+      - "127.0.0.1:2089:2089"
+    restart: "no"
+    read_only: true
+    tmpfs:
+      - /tmp

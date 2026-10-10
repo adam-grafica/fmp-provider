@@ -1,6 +1,13 @@
-// FMP — FreeModels Provider v2.1.0
+// FMP — FreeModels Provider v2.2.0
 // Traductor OpenAI-compatible + Anthropic-compatible hacia freemodels.pro.
 // Sin dependencias. Loopback-only por defecto (127.0.0.1:2089).
+//
+// Postura de seguridad (v2.2.0, contrato en lib/):
+// - FMP solo TRANSPORTA esquemas de tool-calls; nunca ejecuta tools,
+//   comandos ni acciones del host. El cliente/harness ejecuta.
+// - Identidades de modelo declaradas por upstream, NO verificadas.
+// - Auth por API key en endpoints no-salud cuando hay claves.
+// - Falla cerrado: sin fallback silencioso de modelo.
 //
 // Diseño v2 (2026-10-09, evidencia en mano):
 // - El worker CORTA el SSE intermitente sin `data: [DONE]`. Estrategia:
@@ -27,18 +34,40 @@ const http = require("node:http");
 const crypto = require("node:crypto");
 const fs = require("node:fs");
 
-const PORT = Number(process.env.PORT || 2089);
-const HOST = process.env.HOST || "127.0.0.1";
-const UPSTREAM = process.env.FMP_UPSTREAM || "https://freemodels-chat.freemodels.workers.dev";
+const { loadConfig, validateConfig, redactConfig } = require("./lib/config");
+const MODELS_LIB = require("./lib/models");
+const TOOLS_LIB = require("./lib/tools");
+const SEC = require("./lib/security");
+
+// ---- configuration contract: validate before anything listens ----
+const CFG = loadConfig(process.env);
+{
+  const { errors, warnings } = validateConfig(CFG);
+  if (errors.length) {
+    for (const e of errors) console.error(`[fmp-provider] CONFIG ERROR: ${e}`);
+    console.error("[fmp-provider] refusing startup: fix configuration and retry (see .env.example / fmp doctor).");
+    process.exit(1);
+  }
+  for (const w of warnings) console.error(`[fmp-provider] ${w}`);
+}
+
+const PORT = CFG.port;
+const HOST = CFG.host;
+const UPSTREAM = CFG.upstream;
 const ORIGIN = "https://freemodels.pro";
-const UPSTREAM_TIMEOUT_MS = Number(process.env.FMP_TIMEOUT_MS || 120_000);
-const MAX_BODY_BYTES = 10 * 1024 * 1024;
-const MAX_RETRIES = Number(process.env.FMP_MAX_RETRIES || 5);
-const RETRY_BASE_MS = Number(process.env.FMP_RETRY_BASE_MS || 1500);
-const TRACE_FILE = process.env.SHIM_TRACE || process.env.FMP_TRACE || "";
+const UPSTREAM_TIMEOUT_MS = CFG.upstreamTimeoutMs;
+const MAX_BODY_BYTES = CFG.maxRequestBytes;
+const MAX_RETRIES = CFG.maxRetries;
+const RETRY_BASE_MS = CFG.retryBaseMs;
+const TRACE_FILE = CFG.traceFile;
+// Request IDs de correlación (Phase 4). Se propagan en respuestas y
+// errores sanitizados; nunca llevan material secreto.
+const rid = () => crypto.randomBytes(12).toString("hex");
+const requestIdOf = (req) =>
+  String((req.headers && (req.headers["x-request-id"] || req.headers["x-correlation-id"])) || "").slice(0, 64) || rid();
 // Techo profesional: aunque el cliente pida más, FMP nunca emite más de
 // este tope (protege al agente de blowups de 64k/128k). Default 8192.
-const MAX_TOKENS_CEIL = Number(process.env.FMP_MAX_TOKENS_CEIL || 8192);
+const MAX_TOKENS_CEIL = CFG.maxTokensCeil;
 // Normaliza el max pedido: default por ruta, respeta cliente, aplica techo.
 function effMaxTokens(requested, routeDefault) {
   const dflt = Number(routeDefault) || 4096;
@@ -48,15 +77,18 @@ function effMaxTokens(requested, routeDefault) {
 }
 
 // ---- Plan premium: tiers, rate-limit, cola ----
+// Tiers por API key (Authorization: Bearer <key> o x-api-key) — legado,
+// mantenido por compatibilidad. Si FMP_API_KEYS está configurado, el
+// RateLimiter global (FMP_RATE_LIMIT_RPM, Phase 4) también aplica.
 // Tiers por API key (Authorization: Bearer <key> o x-api-key).
 // FMP_KEYS="key1:tier,key2:tier" ej: "sk-lan:pro,sk-casa:free".
 // Sin key configurada: todo pasa como free sin límite (modo local).
 const TIER_LIMITS = {
-  free: { rpm: Number(process.env.FMP_FREE_RPM || 10), concurrency: Number(process.env.FMP_FREE_CONC || 2) },
-  pro: { rpm: Number(process.env.FMP_PRO_RPM || 120), concurrency: Number(process.env.FMP_PRO_CONC || 16) },
+  free: { rpm: CFG.freeRpm, concurrency: CFG.freeConc },
+  pro: { rpm: CFG.proRpm, concurrency: CFG.proConc },
 };
 const KEY_TIERS = {};
-for (const pair of String(process.env.FMP_KEYS || "").split(",").map((s) => s.trim()).filter(Boolean)) {
+for (const pair of String(CFG.legacyKeys || "").split(",").map((s) => s.trim()).filter(Boolean)) {
   const [k, t] = pair.split(":");
   if (k) KEY_TIERS[k] = t === "pro" ? "pro" : "free";
 }
@@ -65,10 +97,11 @@ const tierState = {
   pro: { inFlight: 0, hits: [] },
 };
 const usage = { free: { requests: 0, tokens: 0, errors: 0 }, pro: { requests: 0, tokens: 0, errors: 0 }, local: { requests: 0, tokens: 0, errors: 0 } };
+// Rate limiting global Phase 4 (FMP_RATE_LIMIT_RPM; 0 = deshabilitado).
+const GLOBAL_LIMITER = new SEC.RateLimiter(CFG.rateLimitRpm);
 
 function tierOf(req) {
-  const h = req.headers["authorization"] || req.headers["x-api-key"] || "";
-  const key = String(h).replace(/^bearer\s+/i, "").trim();
+  const key = SEC.extractKey(req);
   if (!key) return "local";
   return KEY_TIERS[key] || "local";
 }
@@ -93,30 +126,27 @@ function takeSlot(tier) {
   return () => { st.inFlight = Math.max(0, st.inFlight - 1); };
 }
 
-function limitResponse(res, info) {
-  res.writeHead(429, {
+function limitResponse(res, info, requestId, req) {
+  const headers = {
     "content-type": "application/json",
     "retry-after": String(info.retryAfter || 5),
-    "access-control-allow-origin": "*",
-  });
+    "x-request-id": requestId || "",
+  };
+  const allow = req ? corsOriginFor(req) : null;
+  if (allow) headers["access-control-allow-origin"] = allow;
+  res.writeHead(429, headers);
   res.end(JSON.stringify({ error: { message: `rate limit (${info.reason}), retry in ${info.retryAfter || 5}s — plan premium avaliable`, type: "rate_limit_error", code: "rate_limited" } }));
 }
 
-const MODELS = [
-  { id: "claude-opus-5.5", name: "Claude Opus 5.5", owned_by: "anthropic" },
-  { id: "claude-sonnet-5", name: "Claude Sonnet 5", owned_by: "anthropic" },
-  { id: "claude-fable-5", name: "Claude Fable 5", owned_by: "anthropic" },
-  { id: "claude-fable-5.1", name: "Claude Fable 5.1", owned_by: "anthropic" },
-  { id: "sol", name: "Sol", owned_by: "fmp" },
-  { id: "terra", name: "Terra", owned_by: "fmp" },
-  { id: "glm-5.2", name: "GLM 5.2", owned_by: "zai" },
-  { id: "kimi-k3", name: "Kimi K3", owned_by: "moonshot" },
-];
+// Catálogo de alias honesto (ver lib/models.js): identidades declaradas
+// por upstream, verified_identity siempre "unknown" sin evidencia.
+const DISABLED_MODELS = new Set(CFG.disabledModels);
+const KILL_ALL = !!(CFG.killAll.present && CFG.killAll.value);
+const MODELS = MODELS_LIB.CATALOG.map((m) => ({ id: m.id, owned_by: m.owned_by }));
 const MODEL_IDS = new Set(MODELS.map((m) => m.id));
 
 const startedAt = Date.now();
 const stats = { requests: 0, retries: 0, truncatedUpstream: 0, errors: 0 };
-const rid = () => crypto.randomBytes(12).toString("hex");
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const estTokens = (s) => Math.max(1, Math.ceil((s || "").length / 4));
 
@@ -132,25 +162,50 @@ function applyMaxTokens(text, maxTokens) {
 
 function trace(msg) {
   if (!TRACE_FILE) return;
-  try { fs.appendFileSync(TRACE_FILE, `[${new Date().toISOString()}] ${msg}\n`); } catch {}
+  // Sanitizado: nunca escribir material secreto en trace.
+  try { fs.appendFileSync(TRACE_FILE, `[${new Date().toISOString()}] ${SEC.redactSecrets(String(msg))}\n`); } catch {}
 }
 
-function sendJson(res, status, obj) {
+function corsOriginFor(req) {
+  // CORS deny-by-default (Phase 4): solo orígenes explícitos reciben
+  // Access-Control-Allow-Origin; el resto no recibe cabecera CORS.
+  const origins = CFG.corsOrigins;
+  if (!origins || !origins.length) return null;
+  const reqOrigin = String((req.headers && req.headers.origin) || "").trim();
+  if (!reqOrigin) return null;
+  if (origins.includes("*")) return "*";
+  return origins.includes(reqOrigin) ? reqOrigin : null;
+}
+
+function sendJson(res, status, obj, req) {
   const body = JSON.stringify(obj);
-  res.writeHead(status, {
+  const headers = {
     "content-type": "application/json",
     "content-length": Buffer.byteLength(body),
-    "access-control-allow-origin": "*",
-  });
+  };
+  const allow = req ? corsOriginFor(req) : null;
+  if (allow) headers["access-control-allow-origin"] = allow;
+  res.writeHead(status, headers);
   res.end(body);
 }
 
-function openaiError(res, status, message, code = null) {
-  sendJson(res, status, { error: { message, type: "server_error", code } });
+function sseHeaders(req) {
+  const h = {
+    "content-type": "text/event-stream",
+    "cache-control": "no-cache",
+    connection: "keep-alive",
+  };
+  const allow = req ? corsOriginFor(req) : null;
+  if (allow) h["access-control-allow-origin"] = allow;
+  return h;
 }
 
-function anthropicError(res, status, message) {
-  sendJson(res, status, { type: "error", error: { type: "api_error", message } });
+function openaiError(res, status, message, code, req) {
+  sendJson(res, status, { error: { message, type: "server_error", code: code || null } }, req);
+}
+
+function anthropicError(res, status, message, req) {
+  sendJson(res, status, { type: "error", error: { type: "api_error", message } }, req);
 }
 
 function readBody(req) {
@@ -167,12 +222,8 @@ function readBody(req) {
   });
 }
 
-// "fmp-oai/sol" -> "sol"; "sol" -> "sol"
-function stripPrefix(model) {
-  if (typeof model !== "string") return "";
-  const i = model.lastIndexOf("/");
-  return (i >= 0 ? model.slice(i + 1) : model).trim();
-}
+// "fmp-oai/sol" -> "sol"; "sol" -> "sol" (ver lib/models.js).
+const stripPrefix = MODELS_LIB.stripPrefix;
 
 function textOfContent(content) {
   if (content == null) return "";
@@ -257,7 +308,7 @@ async function callUpstream({ messages, modelId, stream, thinking, deepSearch, s
         "content-type": "application/json",
         origin: ORIGIN,
         referer: ORIGIN + "/chat",
-        "user-agent": "fmp-provider/1.0",
+        "user-agent": "fmp-provider/" + MODELS_LIB.VERSION,
         accept: stream ? "text/event-stream" : "application/json",
       },
       body: JSON.stringify({ messages, modelId, thinking: !!thinking, deepSearch: !!deepSearch, stream }),
@@ -411,22 +462,38 @@ function dedupeAppend(base, add) {
 
 // ---- handlers ----
 
-function handleModels(res) {
-  sendJson(res, 200, {
-    object: "list",
-    data: MODELS.map((m) => ({ id: m.id, object: "model", created: 0, owned_by: m.owned_by })),
-  });
+function healthState() {
+  // healthy: requests flowing, error rate low. degraded: errors present
+  // but serving. unavailable: kill switch engaged.
+  if (KILL_ALL) return "unavailable";
+  if (stats.errors > 0 && stats.requests > 0 && stats.errors / stats.requests > 0.5) return "degraded";
+  return "healthy";
 }
 
-function handleHealth(res) {
+function handleModels(res, req) {
+  sendJson(res, 200, {
+    object: "list",
+    data: MODELS_LIB.listModels(DISABLED_MODELS),
+  }, req);
+}
+
+function handleHealth(res, req) {
   sendJson(res, 200, {
     ok: true,
     service: "fmp-provider",
-    version: "2.1.0",
+    version: MODELS_LIB.VERSION,
+    status: healthState(),
     upstream: UPSTREAM,
     models: MODELS.map((m) => m.id),
     uptime_s: Math.floor((Date.now() - startedAt) / 1000),
     stats,
+    routes: {
+      openai: CFG.enableOpenAI.present ? !!CFG.enableOpenAI.value : true,
+      anthropic: CFG.enableAnthropic.present ? !!CFG.enableAnthropic.value : true,
+      responses: CFG.enableResponses.present ? !!CFG.enableResponses.value : false,
+    },
+    tool_mode: "transport_only",
+    kill_switch: KILL_ALL,
     tiers: {
       free: { ...TIER_LIMITS.free, inFlight: tierState.free.inFlight, usage: usage.free },
       pro: { ...TIER_LIMITS.pro, inFlight: tierState.pro.inFlight, usage: usage.pro },
@@ -435,28 +502,101 @@ function handleHealth(res) {
     // Honestidad: el worker NO expone canal thinking separado; thinking:true
     // se reenvía y el modelo razona en el texto. Sin bloques fabricados.
     thinking: { mode: "worker-passthrough", separate_channel: false },
-  });
+  }, req);
 }
 
-function handleUsage(res) {
-  sendJson(res, 200, { object: "usage", usage, tiers: TIER_LIMITS, uptime_s: Math.floor((Date.now() - startedAt) / 1000) });
+function handleStats(res, req) {
+  sendJson(res, 200, {
+    ok: true,
+    service: "fmp-provider",
+    status: healthState(),
+    requests: stats.requests,
+    retries: stats.retries,
+    truncatedUpstream: stats.truncatedUpstream,
+    errors: stats.errors,
+    stats,
+    uptime_s: Math.floor((Date.now() - startedAt) / 1000),
+  }, req);
 }
 
-async function handleChatCompletions(req, res, body) {
+function handleUsage(res, req) {
+  sendJson(res, 200, { object: "usage", usage, tiers: TIER_LIMITS, uptime_s: Math.floor((Date.now() - startedAt) / 1000) }, req);
+}
+
+// Sanitized route metadata on every inference response (Phase 2):
+// alias seleccionado + ruta, sin material secreto ni fallback oculto.
+function routeMeta(alias, route) {
+  return {
+    alias,
+    route,
+    declared_identity: (MODELS_LIB.CATALOG.find((m) => m.id === alias) || {}).declared_identity || "unknown",
+    verified_identity: "unknown",
+  };
+}
+
+async function handleChatCompletions(req, res, body, requestId) {
   stats.requests++;
+  const openaiOn = CFG.enableOpenAI.present ? !!CFG.enableOpenAI.value : true;
+  if (!openaiOn) {
+    stats.errors++;
+    return sendJson(res, 404, {
+      error: { message: "openai route disabled (FMP_ENABLE_OPENAI=false)", type: "invalid_request_error", code: "route_disabled" },
+    }, req);
+  }
   const tier = tierOf(req);
+  const gl = GLOBAL_LIMITER.check(tier + ":chat");
+  if (!gl.allowed) { stats.errors++; usage[tier].errors++; return limitResponse(res, { retryAfter: gl.retryAfter, reason: "rpm" }, requestId); }
   const limited = checkLimit(tier);
-  if (limited) { usage[tier].errors++; return limitResponse(res, limited); }
+  if (limited) { usage[tier].errors++; return limitResponse(res, limited, requestId); }
   const release = takeSlot(tier);
+  // Explicit model selection required; never fall back silently (Phase 2).
+  if (typeof body.model !== "string" || !stripPrefix(body.model)) {
+    release();
+    stats.errors++;
+    return sendJson(res, 400, {
+      error: { message: "model is required: request must explicitly select an alias (no ambient fallback)", type: "invalid_request_error", code: "model_required" },
+    }, req);
+  }
   const model = stripPrefix(body.model);
-  if (!MODEL_IDS.has(model)) {
+  if (!MODELS_LIB.isKnown(model)) {
+    release();
+    stats.errors++;
     return sendJson(res, 404, {
       error: { message: `model '${body.model}' not found. Valid: ${[...MODEL_IDS].join(", ")}`, type: "invalid_request_error", code: "model_not_found" },
-    });
+    }, req);
   }
+  if (KILL_ALL || DISABLED_MODELS.has(model)) {
+    release();
+    stats.errors++;
+    usage[tier].errors++;
+    return sendJson(res, 503, {
+      error: { message: `model '${model}' unavailable (kill switch / disabled alias)`, type: "server_error", code: "alias_disabled" },
+    }, req);
+  }
+  // Tool schemas validated BEFORE any upstream call (Phase 3).
+  // Malformed schemas rejected explicitly; never executed, only transported.
+  const toolCheck = TOOLS_LIB.validateOpenAITools(body.tools);
+  if (!toolCheck.ok) {
+    release();
+    stats.errors++;
+    return sendJson(res, 400, {
+      error: { message: `invalid tools schema: ${toolCheck.error}`, type: "invalid_request_error", code: "invalid_tool_schema" },
+    }, req);
+  }
+  if (body.tool_choice !== undefined && body.tool_choice !== null
+      && typeof body.tool_choice !== "string" && typeof body.tool_choice !== "object") {
+    release();
+    stats.errors++;
+    return sendJson(res, 400, {
+      error: { message: "invalid tool_choice: must be 'auto', 'none', 'required' or an object", type: "invalid_request_error", code: "invalid_tool_schema" },
+    }, req);
+  }
+  const oaiDefs = toolCheck.defs;
   const workerMessages = toWorkerMessagesOA(body.messages);
   if (!workerMessages.length) {
-    return sendJson(res, 400, { error: { message: "messages required", type: "invalid_request_error", code: "bad_request" } });
+    release();
+    stats.errors++;
+    return sendJson(res, 400, { error: { message: "messages required", type: "invalid_request_error", code: "bad_request" } }, req);
   }
   const stream = body.stream === true;
   const thinking = !!body.thinking;
@@ -472,9 +612,10 @@ async function handleChatCompletions(req, res, body) {
   const created = Math.floor(Date.now() / 1000);
   const logTag = `OAI/${model}/${id.slice(-6)}`;
 
-  // Puente tool-use: si el cliente declara tools, pedir EXEC::: al worker.
+  // Puente tool-use (TRANSPORTE, no ejecución): si el cliente declara
+  // tools, pedir EXEC::: al worker. FMP nunca ejecuta la herramienta;
+  // el harness cliente ejecuta y devuelve el resultado.
   const oaiTools = Array.isArray(body.tools) ? body.tools : [];
-  const oaiDefs = toolDefsForWorker(oaiTools.map((t) => (t && t.function ? { type: "function", name: t.function.name, description: t.function.description, parameters: t.function.parameters } : t)));
   let wm = workerMessages;
   if (oaiDefs.length && body.tool_choice !== "none") {
     const sys = agentSystemPrompt(oaiTools);
@@ -508,7 +649,8 @@ async function handleChatCompletions(req, res, body) {
       stats.errors++;
       usage[tier].errors++;
       release();
-      return openaiError(res, e.status && e.status < 500 ? e.status : 502, e.message);
+      const s = SEC.sanitizeUpstreamError(e, requestId);
+      return openaiError(res, s.status, s.message, "upstream_error", req);
     }
     usage[tier].tokens += estTokens(got.text);
     const capped = applyMaxTokens(got.text, maxTokens);
@@ -516,8 +658,11 @@ async function handleChatCompletions(req, res, body) {
     got = { text: capped.text, complete: got.complete, finish: capped.hit ? "length" : got.finish };
     const tc = oaiDefs.length ? await resolveToolCall(got.text, oaiDefs, wm, model, logTag) : null;
     if (tc) {
-      trace(`${logTag} TOOL-CALL name=${tc.name}`);
+      // Solo nombre de tool en logs — nunca argumentos (Phase 3).
+      trace(`${logTag} TOOL-TRANSPORT name=${tc.name} (transport only, not executed)`);
       release();
+      const priorId = TOOLS_LIB.findPriorCallId(
+        (TOOLS_LIB.openAICallsToInternal(body.tool_calls || []).calls || []), tc.name);
       return sendJson(res, 200, {
         id, object: "chat.completion", created, model,
         choices: [{
@@ -525,19 +670,21 @@ async function handleChatCompletions(req, res, body) {
           message: {
             role: "assistant",
             content: tc.prefixText || null,
-            tool_calls: [{ id: "call_" + rid().slice(0, 20), type: "function", function: { name: tc.name, arguments: tc.args } }],
+            tool_calls: [{ id: priorId || ("call_" + rid().slice(0, 20)), type: "function", function: { name: tc.name, arguments: tc.args } }],
           },
           finish_reason: "tool_calls",
         }],
         usage: { prompt_tokens: estTokens(JSON.stringify(wm)), completion_tokens: estTokens(got.text), total_tokens: 0 },
-      });
+        _meta: routeMeta(model, "openai"),
+      }, req);
     }
     release();
     return sendJson(res, 200, {
       id, object: "chat.completion", created, model,
       choices: [{ index: 0, message: { role: "assistant", content: got.text }, finish_reason: got.finish }],
       usage: { prompt_tokens: estTokens(JSON.stringify(wm)), completion_tokens: estTokens(got.text), total_tokens: 0 },
-    });
+      _meta: routeMeta(model, "openai"),
+    }, req);
   }
 
   // STREAM EN VIVO: pass-through inmediato + resume si el worker corta.
@@ -556,19 +703,15 @@ async function handleChatCompletions(req, res, body) {
       stats.errors++;
       usage[tier].errors++;
       release();
-      return openaiError(res, e.status && e.status < 500 ? e.status : 502, e.message);
+      const s = SEC.sanitizeUpstreamError(e, requestId);
+      return openaiError(res, s.status, s.message, "upstream_error", req);
     }
     const capped = applyMaxTokens(got.text, maxTokens);
     if (capped.hit) trace(`${logTag} MAXTOKENS cut=${got.text.length}->${capped.text.length}`);
     const ftext = capped.text;
     const ffinish = capped.hit ? "length" : got.finish;
     usage[tier].tokens += estTokens(ftext);
-    res.writeHead(200, {
-      "content-type": "text/event-stream",
-      "cache-control": "no-cache",
-      connection: "keep-alive",
-      "access-control-allow-origin": "*",
-    });
+    res.writeHead(200, sseHeaders(req));
     const fsend = (obj) => res.write("data: " + JSON.stringify(obj) + "\n\n");
     fsend({ id, object: "chat.completion.chunk", created, model, choices: [{ index: 0, delta: { role: "assistant" }, finish_reason: null }] });
     const CH = 48;
@@ -581,12 +724,7 @@ async function handleChatCompletions(req, res, body) {
     release();
     return res.end();
   }
-  res.writeHead(200, {
-    "content-type": "text/event-stream",
-    "cache-control": "no-cache",
-    connection: "keep-alive",
-    "access-control-allow-origin": "*",
-  });
+  res.writeHead(200, sseHeaders(req));
   const send = (obj) => res.write("data: " + JSON.stringify(obj) + "\n\n");
   let closed = false;
   req.on("close", () => { closed = true; });
@@ -692,7 +830,7 @@ async function handleChatCompletions(req, res, body) {
       const tcId = "call_" + rid().slice(0, 20);
       send({ id, object: "chat.completion.chunk", created, model, choices: [{ index: 0, delta: { tool_calls: [{ index: 0, id: tcId, type: "function", function: { name: tcLive.name, arguments: tcLive.args } }] }, finish_reason: null }] });
       send({ id, object: "chat.completion.chunk", created, model, choices: [{ index: 0, delta: {}, finish_reason: "tool_calls" }] });
-      trace(`${logTag} LIVE TOOL-CALL name=${tcLive.name}`);
+      trace(`${logTag} LIVE TOOL-TRANSPORT name=${tcLive.name} (transport only, not executed)`);
     } else {
       send({ id, object: "chat.completion.chunk", created, model, choices: [{ index: 0, delta: {}, finish_reason: finalReason }] });
     }
@@ -764,24 +902,17 @@ function toWorkerMessagesResp(input) {
   return [];
 }
 
-// Extrae llamada a herramienta del texto del worker.
+// Extrae llamada a herramienta del texto del worker (TRANSPORTE).
 // Protocolo: el worker emite bloque
 //   EXEC:::<tool> ARGS <json>
-// y el puente lo convierte a function_call nativo.
+// y el puente lo convierte a function_call nativo. FMP nunca ejecuta;
+// el harness cliente ejecuta con sus propios permisos y aprobaciones.
+// Valida contra lib/tools.js (fuente única); args se devuelve como
+// string JSON validado para los emisores de esquema nativo.
 function parseToolCall(text, availTools) {
-  if (!text || !Array.isArray(availTools) || !availTools.length) return null;
-  const i = text.indexOf("EXEC:::");
-  if (i < 0) return null;
-  const rest = text.slice(i + 7).trim().split("\n")[0].trim();
-  const m = rest.match(/^([A-Za-z0-9_.-]+)\s+ARGS\s+(\{[\s\S]*\})\s*$/);
-  if (!m) return null;
-  const [, name, argsJson] = m;
-  const tool = availTools.find((t) => t.name === name);
-  if (!tool) return null;
-  let args = argsJson;
-  try { JSON.parse(argsJson); } catch { return null; }
-  const t = text.slice(0, i).trim();
-  return { name, args, prefixText: t };
+  const hit = TOOLS_LIB.parseExecBlock(text, availTools);
+  if (!hit) return null;
+  return { name: hit.name, args: JSON.stringify(hit.args), prefixText: hit.prefixText };
 }
 
 // Fallback agéntico: si el worker no emitió EXEC::: pero el texto trae
@@ -797,8 +928,9 @@ function extractShellBlock(text) {
   return cmd;
 }
 
-// Resuelve llamada a herramienta con 3 niveles:
-// 1. EXEC::: explícito. 2. bloque shell -> exec_command.
+// Resuelve llamada a herramienta con 3 niveles (TRANSPORTE, no ejecución):
+// 1. EXEC::: explícito. 2. bloque shell -> exec_command (SOLO si el
+// cliente declaró exec_command; el cliente decide si ejecuta).
 // 3. reintento dirigido que pide SOLO el bloque.
 async function resolveToolCall(text, defs, wm, modelId, logTag) {
   let tc = parseToolCall(text, defs);
@@ -807,7 +939,8 @@ async function resolveToolCall(text, defs, wm, modelId, logTag) {
   const execTool = (defs || []).find((t) => t.name === "exec_command");
   if (shellCmd && execTool) {
     const i = text.indexOf("```");
-    trace(`${logTag} SHELL-BLOCK-CALL cmd=${shellCmd.slice(0, 200)}`);
+    // Solo el NOMBRE de la tool en logs — nunca el comando (Phase 3).
+    trace(`${logTag} SHELL-BLOCK-TRANSPORT name=exec_command (transport only, not executed)`);
     return { name: "exec_command", args: JSON.stringify({ cmd: shellCmd }), prefixText: text.slice(0, i).trim() };
   }
   if (defs && defs.length && wm && modelId) {
@@ -832,31 +965,21 @@ async function resolveToolCall(text, defs, wm, modelId, logTag) {
   return null;
 }
 
-function toolDefsForWorker(tools) {
-  return (tools || [])
-    .filter((t) => t && (t.type === "function" || t.name) && (t.name || (t.function && t.function.name)))
-    .map((t) => {
-      const fn = t.type === "function" ? t : { name: t.name, description: t.description, parameters: t.input_schema };
-      const name = fn.name || (t.function && t.function.name) || "";
-      const desc = fn.description || (t.function && t.function.description) || "";
-      const params = fn.parameters || (t.function && t.function.parameters) || {};
-      return { name, description: String(desc).slice(0, 400), params };
-    })
-    .filter((d) => d.name)
-    .slice(0, 25);
-}
+const toolDefsForWorker = TOOLS_LIB.toolDefsForWorker;
 
 function agentSystemPrompt(tools) {
   const defs = toolDefsForWorker(tools);
   if (!defs.length) return "";
   const lines = defs.map((d) => `- ${d.name}: ${d.description} params=${JSON.stringify(d.params).slice(0, 800)}`);
   return [
-    "Eres un agente con herramientas. PUEDES y DEBES ejecutar comandos cuando el usuario lo pida.",
-    "Para actuar, responde PRIMERO un texto breve y LUEGO en línea propia el bloque:",
+    // Transporte, no ejecución: FMP propone la llamada; el CLIENTE
+    // (harness) la ejecuta bajo sus propios permisos/aprobaciones.
+    "Tienes herramientas disponibles a través del cliente. Para PROPONER una llamada (el cliente decide si la ejecuta),",
+    "responde PRIMERO un texto breve y LUEGO en línea propia el bloque:",
     "EXEC:::<nombre_herramienta> ARGS <json con los parámetros>",
     "Usa SOLO estas herramientas:",
     ...lines,
-    "Para comandos shell usa exec_command con {\"cmd\": \"...\"}. Si no necesitas herramientas, responde normal sin bloque EXEC.",
+    "Para comandos shell propón exec_command con {\"cmd\": \"...\"} solo si está en la lista (el cliente pide aprobación antes de ejecutar). Si no necesitas herramientas, responde normal sin bloque EXEC.",
   ].join("\n");
 }
 
@@ -889,11 +1012,21 @@ async function resolveResponsesText(body, workerMessages, model, logTag) {
   return { result, status };
 }
 
-async function handleResponses(req, res, body) {
+async function handleResponses(req, res, body, requestId) {
   stats.requests++;
+  // Responses API: experimental, disabled by default (Phase 2).
+  const rspOn = CFG.enableResponses.present ? !!CFG.enableResponses.value : false;
+  if (!rspOn) {
+    stats.errors++;
+    return sendJson(res, 404, {
+      error: { message: "responses route disabled by default (set FMP_ENABLE_RESPONSES=true to enable, experimental)", type: "invalid_request_error", code: "route_disabled" },
+    }, req);
+  }
   const tier = tierOf(req);
+  const gl = GLOBAL_LIMITER.check(tier + ":responses");
+  if (!gl.allowed) { stats.errors++; usage[tier].errors++; return limitResponse(res, { retryAfter: gl.retryAfter, reason: "rpm" }, requestId, req); }
   const limited = checkLimit(tier);
-  if (limited) { usage[tier].errors++; return limitResponse(res, limited); }
+  if (limited) { usage[tier].errors++; return limitResponse(res, limited, requestId, req); }
   const release = takeSlot(tier);
   body.__tier = tier;
   body.__release = release;
@@ -910,11 +1043,63 @@ async function handleResponses(req, res, body) {
     } catch {}
   } catch {}
   const done = (fn) => { try { body.__release(); } catch {} return fn(); };
+  if (typeof body.model !== "string" || !stripPrefix(body.model)) {
+    return done(() => {
+      stats.errors++;
+      return sendJson(res, 400, {
+        error: { message: "model is required: request must explicitly select an alias (no ambient fallback)", type: "invalid_request_error", code: "model_required" },
+      }, req);
+    });
+  }
   const model = stripPrefix(body.model);
-  if (!MODEL_IDS.has(model)) {
-    return done(() => sendJson(res, 404, {
-      error: { message: `model '${body.model}' not found. Valid: ${[...MODEL_IDS].join(", ")}`, type: "invalid_request_error", code: "model_not_found" },
-    }));
+  if (!MODELS_LIB.isKnown(model)) {
+    return done(() => {
+      stats.errors++;
+      return sendJson(res, 404, {
+        error: { message: `model '${body.model}' not found. Valid: ${[...MODEL_IDS].join(", ")}`, type: "invalid_request_error", code: "model_not_found" },
+      }, req);
+    });
+  }
+  if (KILL_ALL || DISABLED_MODELS.has(model)) {
+    return done(() => {
+      stats.errors++;
+      usage[tier].errors++;
+      return sendJson(res, 503, {
+        error: { message: `model '${model}' unavailable (kill switch / disabled alias)`, type: "server_error", code: "alias_disabled" },
+      }, req);
+    });
+  }
+  // Validate Responses function tools explicitly (transport only).
+  if (body.tools !== undefined) {
+    const rspTools = Array.isArray(body.tools) ? body.tools : null;
+    if (!rspTools) {
+      return done(() => {
+        stats.errors++;
+        return sendJson(res, 400, {
+          error: { message: "invalid tools schema: tools must be an array", type: "invalid_request_error", code: "invalid_tool_schema" },
+        }, req);
+      });
+    }
+    for (let i = 0; i < rspTools.length; i++) {
+      const t = rspTools[i];
+      if (!t || typeof t !== "object" || (t.type !== "function" && !t.name)) {
+        return done(() => {
+          stats.errors++;
+          return sendJson(res, 400, {
+            error: { message: `invalid tools schema: tools[${i}] must be a function tool object`, type: "invalid_request_error", code: "invalid_tool_schema" },
+          }, req);
+        });
+      }
+      const nm = t.name || (t.function && t.function.name);
+      if (typeof nm !== "string" || !TOOLS_LIB.NAME_RE.test(nm)) {
+        return done(() => {
+          stats.errors++;
+          return sendJson(res, 400, {
+            error: { message: `invalid tools schema: tools[${i}].name is invalid`, type: "invalid_request_error", code: "invalid_tool_schema" },
+          }, req);
+        });
+      }
+    }
   }
   let workerMessages = toWorkerMessagesResp(body.input);
   if (!workerMessages.length && Array.isArray(body.messages)) workerMessages = toWorkerMessagesOA(body.messages);
@@ -922,7 +1107,7 @@ async function handleResponses(req, res, body) {
     workerMessages = [{ role: "system", content: body.instructions }, ...workerMessages];
   }
   if (!workerMessages.length) {
-    return done(() => sendJson(res, 400, { error: { message: "input (string|array) or messages required", type: "invalid_request_error", code: "bad_request" } }));
+    return done(() => sendJson(res, 400, { error: { message: "input (string|array) or messages required", type: "invalid_request_error", code: "bad_request" } }, req));
   }
   const stream = body.stream === true;
   const respId = "resp_" + rid();
@@ -944,7 +1129,10 @@ async function handleResponses(req, res, body) {
   try {
     resolved = await resolveResponsesText(body, workerMessages, model, logTag);
   } catch (e) {
-    return done(() => openaiError(res, 502, e.message));
+    return done(() => {
+      const s = SEC.sanitizeUpstreamError(e, requestId);
+      return openaiError(res, s.status, s.message, "upstream_error", req);
+    });
   }
   const { result, status } = resolved;
   // Límite profesional Responses: max_output_tokens ?? max_tokens.
@@ -956,7 +1144,7 @@ async function handleResponses(req, res, body) {
   const outputTokens = estTokens(result.text);
   // Puente agéntico centralizado (EXEC -> shell-block -> reintento).
   const toolCall = fnTools.length ? await resolveToolCall(result.text, fnTools, workerMessages, model, logTag) : null;
-  if (toolCall) trace(`${logTag} TOOL-CALL name=${toolCall.name} args=${toolCall.args.slice(0, 200)}`);
+  if (toolCall) trace(`${logTag} TOOL-TRANSPORT name=${toolCall.name} (transport only, not executed)`);
   let outputItems;
   let fcItem = null;
   if (toolCall) {
@@ -972,7 +1160,6 @@ async function handleResponses(req, res, body) {
       status: "completed", name: toolCall.name, arguments: toolCall.args,
     };
     outputItems = msgPart.length ? [msgItem, fcItem] : [fcItem];
-    trace(`${logTag} TOOL-CALL name=${toolCall.name} args=${toolCall.args.slice(0, 200)}`);
   } else {
     outputItems = [{
       type: "message", id: "msg_" + rid(), status: rspStatus === "completed" ? "completed" : "incomplete",
@@ -992,12 +1179,7 @@ async function handleResponses(req, res, body) {
     });
   }
 
-  res.writeHead(200, {
-    "content-type": "text/event-stream",
-    "cache-control": "no-cache",
-    connection: "keep-alive",
-    "access-control-allow-origin": "*",
-  });
+  res.writeHead(200, sseHeaders(req));
   const send = (ev, d) => res.write("event: " + ev + "\ndata: " + JSON.stringify(d) + "\n\n");
   let closed = false;
   req.on("close", () => { closed = true; });
@@ -1070,20 +1252,53 @@ async function handleResponses(req, res, body) {
   res.end();
 }
 
-async function handleMessages(req, res, body) {
+async function handleMessages(req, res, body, requestId) {
   stats.requests++;
-  const tier = tierOf(req);
-  const limited = checkLimit(tier);
-  if (limited) { usage[tier].errors++; return limitResponse(res, limited); }
-  const release = takeSlot(tier);
-  const model = stripPrefix(body.model);
-  if (!MODEL_IDS.has(model)) {
-    release();
-    return anthropicError(res, 404, `model '${body.model}' not found. Valid: ${[...MODEL_IDS].join(", ")}`);
+  const anthropicOn = CFG.enableAnthropic.present ? !!CFG.enableAnthropic.value : true;
+  if (!anthropicOn) {
+    stats.errors++;
+    return anthropicError(res, 404, "anthropic route disabled (FMP_ENABLE_ANTHROPIC=false)", req);
   }
+  const tier = tierOf(req);
+  const gl = GLOBAL_LIMITER.check(tier + ":messages");
+  if (!gl.allowed) { stats.errors++; usage[tier].errors++; return limitResponse(res, { retryAfter: gl.retryAfter, reason: "rpm" }, requestId, req); }
+  const limited = checkLimit(tier);
+  if (limited) { usage[tier].errors++; return limitResponse(res, limited, requestId, req); }
+  const release = takeSlot(tier);
+  if (typeof body.model !== "string" || !stripPrefix(body.model)) {
+    release();
+    stats.errors++;
+    return anthropicError(res, 400, "model is required: request must explicitly select an alias (no ambient fallback)", req);
+  }
+  const model = stripPrefix(body.model);
+  if (!MODELS_LIB.isKnown(model)) {
+    release();
+    stats.errors++;
+    return anthropicError(res, 404, `model '${body.model}' not found. Valid: ${[...MODEL_IDS].join(", ")}`, req);
+  }
+  if (KILL_ALL || DISABLED_MODELS.has(model)) {
+    release();
+    stats.errors++;
+    usage[tier].errors++;
+    return anthropicError(res, 503, `model '${model}' unavailable (kill switch / disabled alias)`, req);
+  }
+  // Tool schemas validated BEFORE any upstream call (Phase 3, transport only).
+  const antCheck = TOOLS_LIB.validateAnthropicTools(body.tools);
+  if (!antCheck.ok) {
+    release();
+    stats.errors++;
+    return anthropicError(res, 400, `invalid tools schema: ${antCheck.error}`, req);
+  }
+  if (body.tool_choice !== undefined && body.tool_choice !== null
+      && typeof body.tool_choice !== "string" && typeof body.tool_choice !== "object") {
+    release();
+    stats.errors++;
+    return anthropicError(res, 400, "invalid tool_choice: must be a string or object", req);
+  }
+  const antDefs = antCheck.defs;
   const maxTokens = effMaxTokens(body.max_tokens, 1024);
   const workerMessages = toWorkerMessagesAnt(body.system, body.messages);
-  if (!workerMessages.length) { release(); return anthropicError(res, 400, "messages required"); }
+  if (!workerMessages.length) { release(); stats.errors++; return anthropicError(res, 400, "messages required", req); }
   const stream = body.stream === true;
   // Thinking Anthropic -> flag del worker. El worker razona en el texto;
   // FMP no fabrica bloques thinking (ver /health.thinking).
@@ -1094,9 +1309,9 @@ async function handleMessages(req, res, body) {
   const logTag = `ANT/${model}/${msgId.slice(-6)}`;
   // Límite profesional (igual que OAI): worker ignora max_tokens.
 
-  // Puente tool-use Anthropic: tools [{name, description, input_schema}].
+  // Puente tool-use Anthropic: tools [{name, description, input_schema}]
+  // (TRANSPORTE, no ejecución — el harness cliente ejecuta).
   const antTools = Array.isArray(body.tools) ? body.tools : [];
-  const antDefs = toolDefsForWorker(antTools.map((t) => ({ type: "function", name: t.name, description: t.description, parameters: t.input_schema })));
   let wmAnt = workerMessages;
   const antChoice = body.tool_choice;
   const antDisabled = antChoice && (antChoice.type === "none" || antChoice === "none");
@@ -1123,19 +1338,15 @@ async function handleMessages(req, res, body) {
       stats.errors++;
       usage[tier].errors++;
       release();
-      return anthropicError(res, 502, e.message);
+      const s = SEC.sanitizeUpstreamError(e, requestId);
+      return anthropicError(res, s.status, s.message, req);
     }
     const capped = applyMaxTokens(got, maxTokens);
     if (capped.hit) trace(`${logTag} MAXTOKENS cut=${got.length}->${capped.text.length}`);
     const ftext = capped.hit ? capped.text : got;
     const fstop = capped.hit ? "max_tokens" : "end_turn";
     usage[tier].tokens += estTokens(ftext);
-    res.writeHead(200, {
-      "content-type": "text/event-stream",
-      "cache-control": "no-cache",
-      connection: "keep-alive",
-      "access-control-allow-origin": "*",
-    });
+    res.writeHead(200, sseHeaders(req));
     const fsend = (obj) => res.write("event: " + obj._ev + "\ndata: " + JSON.stringify(obj._d) + "\n\n");
     const fev = (name, d) => ({ _ev: name, _d: d });
     fsend(fev("message_start", { type: "message_start", message: { id: msgId, type: "message", role: "assistant", model, content: [], stop_reason: null, stop_sequence: null, usage: { input_tokens: inputTokens, output_tokens: 1 } } }));
@@ -1167,7 +1378,8 @@ async function handleMessages(req, res, body) {
       stats.errors++;
       usage[tier].errors++;
       release();
-      return anthropicError(res, 502, e.message);
+      const s = SEC.sanitizeUpstreamError(e, requestId);
+      return anthropicError(res, s.status, s.message, req);
     }
     usage[tier].tokens += estTokens(got);
     const cappedAnt = applyMaxTokens(got, maxTokens);
@@ -1183,7 +1395,8 @@ async function handleMessages(req, res, body) {
       if (tc0.prefixText) content0.push({ type: "text", text: tc0.prefixText });
       content0.push({ type: "tool_use", id: "toolu_" + rid().slice(0, 20), name: tc0.name, input });
       stop0 = "tool_use";
-      trace(`${logTag} TOOL-CALL name=${tc0.name}`);
+      // Solo nombre de tool en logs — nunca argumentos (Phase 3).
+      trace(`${logTag} TOOL-TRANSPORT name=${tc0.name} (transport only, not executed)`);
     } else {
       content0 = [{ type: "text", text: got }];
     }
@@ -1194,16 +1407,12 @@ async function handleMessages(req, res, body) {
       stop_reason: stop0,
       stop_sequence: null,
       usage: { input_tokens: inputTokens, output_tokens: estTokens(got) },
-    });
+      _meta: routeMeta(model, "anthropic"),
+    }, req);
   }
 
   // STREAM EN VIVO Anthropic: text_delta en cuanto llega + resume.
-  res.writeHead(200, {
-    "content-type": "text/event-stream",
-    "cache-control": "no-cache",
-    connection: "keep-alive",
-    "access-control-allow-origin": "*",
-  });
+  res.writeHead(200, sseHeaders(req));
   const send = (obj) => res.write("event: " + obj._ev + "\ndata: " + JSON.stringify(obj._d) + "\n\n");
   let closed = false;
   req.on("close", () => { closed = true; });
@@ -1301,7 +1510,7 @@ async function handleMessages(req, res, body) {
       send(ev("content_block_delta", { type: "content_block_delta", index: 1, delta: { type: "input_json_delta", partial_json: JSON.stringify(input) } }));
       send(ev("content_block_stop", { type: "content_block_stop", index: 1 }));
       send(ev("message_delta", { type: "message_delta", delta: { stop_reason: "tool_use", stop_sequence: null }, usage: { output_tokens: estTokens(emitted) } }));
-      trace(`${logTag} LIVE TOOL-CALL name=${tcLive.name}`);
+      trace(`${logTag} LIVE TOOL-TRANSPORT name=${tcLive.name} (transport only, not executed)`);
     } else {
       send(ev("content_block_stop", { type: "content_block_stop", index: 0 }));
       send(ev("message_delta", { type: "message_delta", delta: { stop_reason: antFinal, stop_sequence: null }, usage: { output_tokens: estTokens(emitted) } }));
@@ -1314,43 +1523,105 @@ async function handleMessages(req, res, body) {
   res.end();
 }
 
+// API key gate (Phase 4): every non-health endpoint requires a valid
+// key when FMP_API_KEYS is configured. Health stays public so
+// orchestrators and `fmp health` keep working. Local-open mode
+// (no keys configured) passes everything on localhost.
+function authGate(req, res, requestId) {
+  if (CFG.authMode === "none") return true;
+  if (!CFG.apiKeys.length) return true;
+  if (!SEC.isAuthorized(req, CFG.apiKeys)) {
+    stats.errors++;
+    sendJson(res, 401, {
+      error: { message: "missing or invalid API key (Authorization: Bearer <key> or x-api-key)", type: "authentication_error", code: "invalid_api_key" },
+    }, req);
+    return false;
+  }
+  return true;
+}
+
 const server = http.createServer(async (req, res) => {
+  const requestId = requestIdOf(req);
   try {
     const u = new URL(req.url || "/", "http://x");
     const path = u.pathname.replace(/\/+$/, "") || "/";
 
     if (req.method === "OPTIONS") {
-      res.writeHead(204, { "access-control-allow-origin": "*", "access-control-allow-methods": "GET,POST,OPTIONS", "access-control-allow-headers": "content-type,authorization,x-api-key,anthropic-version" });
+      // CORS deny-by-default: reflect only explicitly allowed origins.
+      const allow = corsOriginFor(req);
+      const headers = {
+        "access-control-allow-methods": "GET,POST,OPTIONS",
+        "access-control-allow-headers": "content-type,authorization,x-api-key,anthropic-version",
+      };
+      if (allow) headers["access-control-allow-origin"] = allow;
+      res.writeHead(204, headers);
       return res.end();
     }
-    if (req.method === "GET" && (path === "/health" || path === "/")) return handleHealth(res);
-    if (req.method === "GET" && (path === "/v1/models" || path === "/models")) return handleModels(res);
-    if (req.method === "GET" && (path === "/v1/usage" || path === "/usage")) return handleUsage(res);
+    if (req.method === "GET" && (path === "/health" || path === "/")) return handleHealth(res, req);
+    // Non-health endpoints: auth gate first.
+    if (req.method === "GET" && (path === "/v1/models" || path === "/models")) {
+      if (!authGate(req, res, requestId)) return;
+      return handleModels(res, req);
+    }
+    if (req.method === "GET" && (path === "/stats" || path === "/v1/stats")) {
+      if (!authGate(req, res, requestId)) return;
+      return handleStats(res, req);
+    }
+    if (req.method === "GET" && (path === "/v1/usage" || path === "/usage")) {
+      if (!authGate(req, res, requestId)) return;
+      return handleUsage(res, req);
+    }
 
     if (req.method === "POST" && (path === "/v1/chat/completions" || path === "/chat/completions")) {
+      if (!authGate(req, res, requestId)) return;
       let body;
       try { body = JSON.parse(await readBody(req)); }
-      catch { return sendJson(res, 400, { error: { message: "invalid JSON body", type: "invalid_request_error", code: "bad_request" } }); }
-      return handleChatCompletions(req, res, body);
+      catch { stats.errors++; return sendJson(res, 400, { error: { message: "invalid JSON body", type: "invalid_request_error", code: "bad_request" } }, req); }
+      return handleChatCompletions(req, res, body, requestId);
     }
     if (req.method === "POST" && (path === "/v1/messages" || path === "/messages")) {
+      if (!authGate(req, res, requestId)) return;
       let body;
       try { body = JSON.parse(await readBody(req)); }
-      catch { return anthropicError(res, 400, "invalid JSON body"); }
-      return handleMessages(req, res, body);
+      catch { stats.errors++; return anthropicError(res, 400, "invalid JSON body", req); }
+      return handleMessages(req, res, body, requestId);
     }
     if (req.method === "POST" && (path === "/v1/responses" || path === "/responses")) {
+      if (!authGate(req, res, requestId)) return;
       let body;
       try { body = JSON.parse(await readBody(req)); }
-      catch { return sendJson(res, 400, { error: { message: "invalid JSON body", type: "invalid_request_error", code: "bad_request" } }); }
-      return handleResponses(req, res, body);
+      catch { stats.errors++; return sendJson(res, 400, { error: { message: "invalid JSON body", type: "invalid_request_error", code: "bad_request" } }, req); }
+      return handleResponses(req, res, body, requestId);
     }
-    return sendJson(res, 404, { error: "not found: " + path });
+    return sendJson(res, 404, { error: "not found: " + path }, req);
   } catch (e) {
-    try { sendJson(res, 500, { error: { message: e.message || "internal error" } }); } catch {}
+    // Never leak internals: sanitized 500 with correlation id.
+    stats.errors++;
+    try { sendJson(res, 500, { error: { message: `internal error (request_id: ${requestId})`, type: "server_error", code: "internal_error" } }, req); } catch {}
   }
 });
 
+// Graceful shutdown (Phase 4): stop accepting, drain in-flight, then exit.
+// In-flight records are request-scoped (no shared file writes), so drain
+// cannot corrupt state; worst case a client sees a truncated stream.
+let shuttingDown = false;
+function shutdown(signal) {
+  if (shuttingDown) return;
+  shuttingDown = true;
+  console.error(`[fmp-provider] ${signal}: draining, no new connections...`);
+  server.close(() => {
+    console.error("[fmp-provider] drained, exiting.");
+    process.exit(0);
+  });
+  // Hard cap: force exit if drain stalls (in-flight streams only).
+  setTimeout(() => {
+    console.error("[fmp-provider] drain timeout, forcing exit.");
+    process.exit(0);
+  }, 15_000).unref();
+}
+process.on("SIGTERM", () => shutdown("SIGTERM"));
+process.on("SIGINT", () => shutdown("SIGINT"));
+
 server.listen(PORT, HOST, () => {
-  console.log(`[fmp-provider] listening on http://${HOST}:${PORT}`);
+  console.log(`[fmp-provider] v${MODELS_LIB.VERSION} listening on http://${HOST}:${PORT} (localhost-only${CFG.apiKeys.length ? ", api_key auth on" : ", local-open mode"})`);
 });
