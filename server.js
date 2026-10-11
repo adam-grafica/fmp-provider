@@ -910,37 +910,51 @@ async function handleChatCompletions(req, res, body, requestId) {
       if (a < MAX_RETRIES) await sleep(RETRY_BASE_MS * (a + 1));
       continue;
     }
-    // CONTINUATION (stability-006, igual que Anthropic): una ronda extra
-    // con la cola emitida como contexto mantiene el SSE abierto y cierra
-    // en stop, no en length. Acotado por MAX_RETRIES; sin solapamiento
+    // CONTINUATION (stability-006, igual que Anthropic): rondas extra
+    // acotadas (MAX_RETRIES) con la cola emitida como contexto mantienen
+    // el SSE abierto y cierran en stop, no en length. Sin solapamiento
     // no se pega nada (cierre honesto).
     if (a < MAX_RETRIES) {
-      trace(`${logTag} LIVE CONTINUE attempt=${attempts} emitted=${emitted.length}`);
-      stats.retries++;
-      routeMetrics[ROUTE].retries++;
-      const tail = emitted.slice(-500);
-      const contMsgs = wm.concat([
-        { role: "assistant", content: tail },
-        { role: "user", content: "Continúa exactamente donde quedaste, sin repetir ni resumir." },
-      ]);
-      try {
-        const contUp = await callUpstream({ messages: contMsgs, modelId: model, stream: true, thinking, deepSearch, signal: ctrl.signal, timeoutMs: TIMEOUT, route: ROUTE });
-        const cont = await readWorkerSSELive(contUp, async (piece) => {
-          if (!closed) emitNovel(piece);
-        }, ctrl.signal);
+      let continued = false;
+      for (let cr = 0; cr < MAX_RETRIES && !closed && !cappedHit; cr++) {
+        trace(`${logTag} LIVE CONTINUE attempt=${attempts}.${cr} emitted=${emitted.length}`);
+        stats.retries++;
+        routeMetrics[ROUTE].retries++;
+        const tail = emitted.slice(-500);
+        const contMsgs = wm.concat([
+          { role: "assistant", content: tail },
+          { role: "user", content: "Continúa exactamente donde quedaste, sin repetir ni resumir." },
+        ]);
+        let cont;
+        try {
+          const contUp = await callUpstream({ messages: contMsgs, modelId: model, stream: true, thinking, deepSearch, signal: ctrl.signal, timeoutMs: TIMEOUT, route: ROUTE });
+          cont = await readWorkerSSELive(contUp, async (piece) => {
+            if (!closed) emitNovel(piece);
+          }, ctrl.signal);
+        } catch (e) {
+          trace(`${logTag} LIVE CONTINUE-FAIL err=${String((e && e.message) || e).slice(0, 120)} -> close honest`);
+          break;
+        }
+        const merged = dedupeAppend(emitted, cont.text);
+        if (merged.length <= emitted.length + 8 && !cont.done) {
+          trace(`${logTag} LIVE CONTINUE-STALLED total=${emitted.length} -> close honest`);
+          break;
+        }
         if (cont.done) {
-          const rest = dedupeAppend(emitted, cont.text).slice(emitted.length);
+          const rest = merged.slice(emitted.length);
           if (rest && !closed) emitNovel(rest);
           complete = !cappedHit;
+          continued = true;
           trace(`${logTag} LIVE CONTINUE-OK total=${emitted.length}`);
           break;
         }
         stats.truncatedUpstream++;
         routeMetrics[ROUTE].truncations++;
-        trace(`${logTag} LIVE CONTINUE-CUT total=${emitted.length} -> close honest`);
-      } catch (e) {
-        trace(`${logTag} LIVE CONTINUE-FAIL err=${String((e && e.message) || e).slice(0, 120)} -> close honest`);
+        trace(`${logTag} LIVE CONTINUE-CUT total=${emitted.length} -> next round`);
+        await sleep(RETRY_BASE_MS);
       }
+      if (continued) break;
+      trace(`${logTag} LIVE CONTINUE-EXHAUSTED total=${emitted.length} -> close honest`);
     } else {
       trace(`${logTag} LIVE TRUNCATED attempt=${attempts} emitted=${emitted.length} -> close honest`);
     }
@@ -1657,39 +1671,55 @@ async function handleMessages(req, res, body, requestId) {
       continue;
     }
     // CONTINUATION (stability-006): upstream cut mid-stream but the client
-    // is still attached. Re-request with the emitted tail as context and
-    // keep the SAME SSE block open — the SDK sees one continuous stream
+    // is still attached. Re-request rounds with the emitted tail as context
+    // and keep the SAME SSE block open — the SDK sees one continuous stream
     // ending in end_turn, not a max_tokens stop (which it misreads as a
-    // 128k overflow error). Bounded by MAX_RETRIES; honest max_tokens
-    // close only when rounds exhaust. No Frankenstein: continuation text
-    // is appended only on tail-overlap, else we close honestly.
+    // 128k overflow error). Bounded: MAX_RETRIES total rounds. Honest
+    // max_tokens close only when rounds exhaust. No Frankenstein:
+    // continuation text is appended only on tail-overlap (dedupeAppend),
+    // a divergent round closes honestly instead of merging.
     if (a < MAX_RETRIES) {
-      trace(`${logTag} LIVE CONTINUE attempt=${attempts} emitted=${emitted.length}`);
-      stats.retries++;
-      routeMetrics[ROUTE].retries++;
-      const tail = emitted.slice(-500);
-      const contMsgs = wmAnt.concat([
-        { role: "assistant", content: tail },
-        { role: "user", content: "Continúa exactamente donde quedaste, sin repetir ni resumir." },
-      ]);
-      try {
-        const contUp = await callUpstream({ messages: contMsgs, modelId: model, stream: true, thinking, deepSearch: false, signal: ctrl.signal, timeoutMs: TIMEOUT, route: ROUTE });
-        const cont = await readWorkerSSELive(contUp, async (piece) => {
-          if (!closed) emitAnt(piece);
-        }, ctrl.signal);
+      let continued = false;
+      for (let cr = 0; cr < MAX_RETRIES && !closed && !cappedHit; cr++) {
+        trace(`${logTag} LIVE CONTINUE attempt=${attempts}.${cr} emitted=${emitted.length}`);
+        stats.retries++;
+        routeMetrics[ROUTE].retries++;
+        const tail = emitted.slice(-500);
+        const contMsgs = wmAnt.concat([
+          { role: "assistant", content: tail },
+          { role: "user", content: "Continúa exactamente donde quedaste, sin repetir ni resumir." },
+        ]);
+        let cont;
+        try {
+          const contUp = await callUpstream({ messages: contMsgs, modelId: model, stream: true, thinking, deepSearch: false, signal: ctrl.signal, timeoutMs: TIMEOUT, route: ROUTE });
+          cont = await readWorkerSSELive(contUp, async (piece) => {
+            if (!closed) emitAnt(piece);
+          }, ctrl.signal);
+        } catch (e) {
+          trace(`${logTag} LIVE CONTINUE-FAIL err=${String((e && e.message) || e).slice(0, 120)} -> close honest`);
+          break;
+        }
+        const merged = dedupeAppend(emitted, cont.text);
+        if (merged.length <= emitted.length + 8 && !cont.done) {
+          // No progress and no DONE: further rounds would loop.
+          trace(`${logTag} LIVE CONTINUE-STALLED total=${emitted.length} -> close honest`);
+          break;
+        }
         if (cont.done) {
-          const rest = dedupeAppend(emitted, cont.text).slice(emitted.length);
+          const rest = merged.slice(emitted.length);
           if (rest && !closed) emitAnt(rest);
           complete = !cappedHit;
+          continued = true;
           trace(`${logTag} LIVE CONTINUE-OK total=${emitted.length}`);
           break;
         }
         stats.truncatedUpstream++;
         routeMetrics[ROUTE].truncations++;
-        trace(`${logTag} LIVE CONTINUE-CUT total=${emitted.length} -> close honest`);
-      } catch (e) {
-        trace(`${logTag} LIVE CONTINUE-FAIL err=${String((e && e.message) || e).slice(0, 120)} -> close honest`);
+        trace(`${logTag} LIVE CONTINUE-CUT total=${emitted.length} -> next round`);
+        await sleep(RETRY_BASE_MS);
       }
+      if (continued) break;
+      trace(`${logTag} LIVE CONTINUE-EXHAUSTED total=${emitted.length} -> close honest`);
     } else {
       trace(`${logTag} LIVE TRUNCATED attempt=${attempts} emitted=${emitted.length} -> close honest`);
     }
