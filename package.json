@@ -1,6 +1,6 @@
 {
   "name": "fmp-provider",
-  "version": "2.3.0",
+  "version": "2.3.1",
   "description": "FMP \u2014 private development inference adapter: OpenAI + Anthropic transport over configured upstream, localhost-only, transport-only tools",
   "main": "server.js",
   "bin": {

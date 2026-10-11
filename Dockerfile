@@ -1,6 +1,6 @@
 # FMP — private development inference adapter. Localhost-only default.
-# Build: docker build -t fmp-provider:2.3.0 .
-# Run:   docker run --rm -p 127.0.0.1:2089:2089 --env-file .env fmp-provider:2.3.0
+# Build: docker build -t fmp-provider:2.3.1 .
+# Run:   docker run --rm -p 127.0.0.1:2089:2089 --env-file .env fmp-provider:2.3.1
 FROM node:22-alpine
 WORKDIR /app
 COPY package.json server.js ./

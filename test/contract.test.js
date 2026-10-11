@@ -24,9 +24,13 @@ test("OpenAI chat non-stream response", async () => {
   // Complete text via SSE-retry or JSON fallback — either path is valid.
   assert.ok(["fixture json reply", "Hello world"].includes(body.choices[0].message.content),
     "got: " + body.choices[0].message.content);
-  assert.equal(body._meta.alias, "sol");
-  assert.equal(body._meta.route, "openai");
-  assert.equal(body._meta.verified_identity, "unknown");
+  // Native schema by default (strict clients); _meta is opt-in.
+  assert.equal(body._meta, undefined);
+  const meta = await H.post(FMP_PORT, "/v1/chat/completions",
+    { model: "sol", messages: [{ role: "user", content: "hi" }] }, null, { "x-fmp-meta": "1" });
+  assert.equal(meta.body._meta.alias, "sol");
+  assert.equal(meta.body._meta.route, "openai");
+  assert.equal(meta.body._meta.verified_identity, "unknown");
 });
 
 test("OpenAI chat stream completes", async () => {
@@ -44,8 +48,12 @@ test("Anthropic messages non-stream response", async () => {
     { model: "sol", max_tokens: 100, messages: [{ role: "user", content: "hi" }] });
   assert.equal(status, 200);
   assert.equal(body.stop_reason, "end_turn");
-  assert.equal(body._meta.route, "anthropic");
-  assert.equal(body._meta.verified_identity, "unknown");
+  // Native schema by default (strict clients); _meta is opt-in.
+  assert.equal(body._meta, undefined);
+  const meta = await H.post(FMP_PORT, "/v1/messages",
+    { model: "sol", max_tokens: 100, messages: [{ role: "user", content: "hi" }] }, null, { "x-fmp-meta": "1" });
+  assert.equal(meta.body._meta.route, "anthropic");
+  assert.equal(meta.body._meta.verified_identity, "unknown");
 });
 
 test("Anthropic stream completes", async () => {

@@ -56,8 +56,8 @@ function kill(child) {
   });
 }
 
-async function post(port, p, body, key) {
-  const headers = { "content-type": "application/json" };
+async function post(port, p, body, key, extraHeaders) {
+  const headers = Object.assign({ "content-type": "application/json" }, extraHeaders || {});
   if (key) headers.authorization = "Bearer " + key;
   const r = await fetch(`http://127.0.0.1:${port}${p}`, { method: "POST", headers, body: JSON.stringify(body) });
   let j = null;

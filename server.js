@@ -756,16 +756,18 @@ async function handleChatCompletions(req, res, body, requestId) {
           finish_reason: "tool_calls",
         }],
         usage: { prompt_tokens: estTokens(JSON.stringify(wm)), completion_tokens: estTokens(got.text), total_tokens: 0 },
-        _meta: routeMeta(model, "openai"),
       }, req);
     }
     release();
-    return sendJson(res, 200, {
+    // _meta opt-in (x-fmp-meta: 1): strict clients (Claude Code SDK) get
+    // byte-clean native schema by default.
+    const oaiBody = {
       id, object: "chat.completion", created, model,
       choices: [{ index: 0, message: { role: "assistant", content: got.text }, finish_reason: got.finish }],
       usage: { prompt_tokens: estTokens(JSON.stringify(wm)), completion_tokens: estTokens(got.text), total_tokens: 0 },
-      _meta: routeMeta(model, "openai"),
-    }, req);
+    };
+    if (req.headers["x-fmp-meta"] === "1") oaiBody._meta = routeMeta(model, "openai");
+    return sendJson(res, 200, oaiBody, req);
   }
 
   // STREAM EN VIVO: pass-through inmediato + resume si el worker corta.
@@ -1517,13 +1519,22 @@ async function handleMessages(req, res, body, requestId) {
       content0 = [{ type: "text", text: got }];
     }
     release();
+    if (req.headers["x-fmp-meta"] === "1") {
+      return sendJson(res, 200, {
+        id: msgId, type: "message", role: "assistant", model,
+        content: content0,
+        stop_reason: stop0,
+        stop_sequence: null,
+        usage: { input_tokens: inputTokens, output_tokens: estTokens(got) },
+        _meta: routeMeta(model, "anthropic"),
+      }, req);
+    }
     return sendJson(res, 200, {
       id: msgId, type: "message", role: "assistant", model,
       content: content0,
       stop_reason: stop0,
       stop_sequence: null,
       usage: { input_tokens: inputTokens, output_tokens: estTokens(got) },
-      _meta: routeMeta(model, "anthropic"),
     }, req);
   }
 
