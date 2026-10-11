@@ -77,6 +77,17 @@ test("unit: unknown EXEC tool rejected (no phantom calls)", () => {
   assert.equal(hit, null);
 });
 
+test("unit: 30+ tools accepted for transport, worker catalog capped", () => {
+  const many = Array.from({ length: 40 }, (_, i) => ({ type: "function", function: { name: "tool_" + i } }));
+  const v = T.validateOpenAITools(many);
+  assert.equal(v.ok, true);
+  assert.equal(v.defs.length, 40);
+  const bridged = T.toolDefsForWorker(many);
+  assert.equal(bridged.length, T.MAX_WORKER_TOOLS);
+  const tooMany = Array.from({ length: 200 }, (_, i) => ({ type: "function", function: { name: "t" + i } }));
+  assert.equal(T.validateOpenAITools(tooMany).ok, false);
+});
+
 test("unit: invalid JSON args rejected", () => {
   const norm = T.openAICallsToInternal([{ id: "c1", type: "function", function: { name: "a", arguments: "{bad" } }]);
   assert.equal(norm.ok, false);
