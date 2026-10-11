@@ -1,12 +1,14 @@
 {
   "name": "fmp-provider",
-  "version": "2.2.1",
-  "description": "FMP — private development inference adapter: OpenAI + Anthropic transport over configured upstream, localhost-only, transport-only tools",
+  "version": "2.3.0",
+  "description": "FMP \u2014 private development inference adapter: OpenAI + Anthropic transport over configured upstream, localhost-only, transport-only tools",
   "main": "server.js",
-  "bin": { "fmp": "bin/fmp.js" },
+  "bin": {
+    "fmp": "bin/fmp.js"
+  },
   "scripts": {
     "start": "node server.js",
-    "test": "node --test test/contract.test.js test/security.test.js test/tools.test.js",
+    "test": "node --test test/contract.test.js test/security.test.js test/tools.test.js test/hardening.test.js",
     "doctor": "node bin/fmp.js doctor",
     "verify": "node bin/fmp.js verify"
   },

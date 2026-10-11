@@ -29,3 +29,17 @@ fmp:
   cors_allow_origins: []      # empty = deny (no ACAO header)
 
   upstream: "https://freemodels-chat.freemodels.workers.dev"
+
+  # Per-route upstream timeouts (ms, unset = global upstream_timeout_ms).
+  timeout_openai_ms: null
+  timeout_anthropic_ms: null
+  timeout_responses_ms: null
+  # SSE heartbeat interval ms (0 disables).
+  heartbeat_ms: 15000
+  # Per-harness output caps (unknown harnesses use global ceil).
+  harness_limits:
+    hermes: 8192
+    opencode: 8192
+    claude-code: 4096
+    antigravity: 4096
+    codex: 8192

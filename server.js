@@ -147,6 +147,57 @@ const MODEL_IDS = new Set(MODELS.map((m) => m.id));
 
 const startedAt = Date.now();
 const stats = { requests: 0, retries: 0, truncatedUpstream: 0, errors: 0 };
+// Per-route metrics (HARDENING-001): latency histogram (ms, capped buckets),
+// errors, truncations, retries, timeouts. Exposed via /stats.
+const ROUTES = ["openai", "anthropic", "responses"];
+const routeMetrics = {};
+for (const r of ROUTES) {
+  routeMetrics[r] = {
+    requests: 0, errors: 0, truncations: 0, retries: 0, timeouts: 0,
+    latencies: [], // last 500 completion latencies, ms
+  };
+}
+function routeTimeoutMs(route) {
+  if (route === "openai" && CFG.timeoutOpenaiMs) return CFG.timeoutOpenaiMs;
+  if (route === "anthropic" && CFG.timeoutAnthropicMs) return CFG.timeoutAnthropicMs;
+  if (route === "responses" && CFG.timeoutResponsesMs) return CFG.timeoutResponsesMs;
+  return UPSTREAM_TIMEOUT_MS;
+}
+function recordLatency(route, ms) {
+  const m = routeMetrics[route];
+  if (!m) return;
+  m.requests++;
+  m.latencies.push(ms);
+  if (m.latencies.length > 500) m.latencies.shift();
+}
+function routeLatencyStats(route) {
+  const arr = (routeMetrics[route] && routeMetrics[route].latencies || []).slice().sort((a, b) => a - b);
+  if (!arr.length) return { n: 0, p50: null, p95: null, p99: null };
+  const q = (p) => arr[Math.min(arr.length - 1, Math.floor(p * arr.length))];
+  return { n: arr.length, p50: q(0.5), p95: q(0.95), p99: q(0.99) };
+}
+function harnessCapFor(req) {
+  // Per-harness output cap: min(global ceil, harness limit when known).
+  const h = require("./lib/config").harnessOf(req);
+  const lim = CFG.harnessLimits[h];
+  if (Number.isInteger(lim) && lim > 0) return { harness: h, cap: Math.min(lim, MAX_TOKENS_CEIL) };
+  return { harness: h, cap: MAX_TOKENS_CEIL };
+}
+// SSE heartbeat: `: ping` comments every HEARTBEAT_MS keep idle streams
+// alive through proxies/middleboxes. Returns a stopper. Comments are
+// ignored by OpenAI/Anthropic SSE parsers (lines starting with ':').
+function startHeartbeat(res, req, logTag) {
+  const ms = CFG.heartbeatMs;
+  if (!ms || ms <= 0) return () => {};
+  let closed = false;
+  req.on("close", () => { closed = true; });
+  const timer = setInterval(() => {
+    if (closed) { clearInterval(timer); return; }
+    try { res.write(": ping\n\n"); } catch { clearInterval(timer); }
+  }, ms);
+  if (timer.unref) timer.unref();
+  return () => clearInterval(timer);
+}
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const estTokens = (s) => Math.max(1, Math.ceil((s || "").length / 4));
 
@@ -293,9 +344,11 @@ function toWorkerMessagesAnt(system, messages) {
   return out;
 }
 
-async function callUpstream({ messages, modelId, stream, thinking, deepSearch, signal }) {
+async function callUpstream({ messages, modelId, stream, thinking, deepSearch, signal, timeoutMs, route }) {
+  const budget = Number.isFinite(timeoutMs) && timeoutMs > 0 ? timeoutMs : UPSTREAM_TIMEOUT_MS;
   const ctrl = new AbortController();
-  const timer = setTimeout(() => ctrl.abort(new Error("upstream timeout")), UPSTREAM_TIMEOUT_MS);
+  let timedOut = false;
+  const timer = setTimeout(() => { timedOut = true; ctrl.abort(new Error("upstream timeout")); }, budget);
   const onAbort = () => ctrl.abort();
   if (signal) {
     if (signal.aborted) ctrl.abort();
@@ -327,6 +380,11 @@ async function callUpstream({ messages, modelId, stream, thinking, deepSearch, s
       throw e;
     }
     return r;
+  } catch (e) {
+    // Explicit timeout signal for metrics: distinguish timeouts from
+    // other upstream failures (never silent, never swallowed).
+    if (timedOut && route && routeMetrics[route]) routeMetrics[route].timeouts++;
+    throw e;
   } finally {
     clearTimeout(timer);
     if (signal) signal.removeEventListener("abort", onAbort);
@@ -396,17 +454,19 @@ async function readWorkerJson(response) {
 // Intento SSE con resume: si el worker corta sin DONE, reintenta y pega.
 // resumeHint: texto ya obtenido; en reintento se pide de nuevo y se
 // descarta solapamiento buscando la cola conocida al inicio del nuevo texto.
-async function fetchCompleteText({ messages, modelId, thinking, deepSearch, signal, logTag }) {
+async function fetchCompleteText({ messages, modelId, thinking, deepSearch, signal, logTag, route, timeoutMs }) {
   let full = "";
   let attempts = 0;
+  const rm = route && routeMetrics[route] ? routeMetrics[route] : null;
   for (let a = 0; a <= MAX_RETRIES; a++) {
     attempts = a + 1;
     let upstream;
     try {
-      upstream = await callUpstream({ messages, modelId, stream: true, thinking, deepSearch, signal });
+      upstream = await callUpstream({ messages, modelId, stream: true, thinking, deepSearch, signal, timeoutMs, route });
     } catch (e) {
       if (a === MAX_RETRIES) throw e;
       stats.retries++;
+      if (rm) rm.retries++;
       trace(`${logTag} upstream-error attempt=${attempts} err=${e.message} -> retry`);
       await sleep(RETRY_BASE_MS * (a + 1));
       continue;
@@ -417,6 +477,7 @@ async function fetchCompleteText({ messages, modelId, thinking, deepSearch, sign
     } catch (e) {
       if (a === MAX_RETRIES) throw e;
       stats.retries++;
+      if (rm) rm.retries++;
       trace(`${logTag} read-error attempt=${attempts} err=${e.message} -> retry`);
       await sleep(RETRY_BASE_MS * (a + 1));
       continue;
@@ -429,6 +490,7 @@ async function fetchCompleteText({ messages, modelId, thinking, deepSearch, sign
     }
     // Truncado sin DONE.
     stats.truncatedUpstream++;
+    if (rm) rm.truncations++;
     full = dedupeAppend(full, chunk.text);
     trace(`${logTag} TRUNCATED attempt=${attempts} charsSoFar=${full.length}`);
     if (a === MAX_RETRIES) {
@@ -436,6 +498,7 @@ async function fetchCompleteText({ messages, modelId, thinking, deepSearch, sign
       return { text: full, attempts, complete: false, aborted: false };
     }
     stats.retries++;
+    if (rm) rm.retries++;
     await sleep(RETRY_BASE_MS * (a + 1));
   }
   return { text: full, attempts, complete: false, aborted: false };
@@ -506,15 +569,26 @@ function handleHealth(res, req) {
 }
 
 function handleStats(res, req) {
+  const routes = {};
+  for (const r of ROUTES) {
+    const m = routeMetrics[r];
+    routes[r] = {
+      requests: m.requests, errors: m.errors, truncations: m.truncations,
+      retries: m.retries, timeouts: m.timeouts,
+      latency_ms: routeLatencyStats(r),
+    };
+  }
   sendJson(res, 200, {
     ok: true,
     service: "fmp-provider",
+    version: MODELS_LIB.VERSION,
     status: healthState(),
     requests: stats.requests,
     retries: stats.retries,
     truncatedUpstream: stats.truncatedUpstream,
     errors: stats.errors,
     stats,
+    routes,
     uptime_s: Math.floor((Date.now() - startedAt) / 1000),
   }, req);
 }
@@ -536,6 +610,10 @@ function routeMeta(alias, route) {
 
 async function handleChatCompletions(req, res, body, requestId) {
   stats.requests++;
+  const ROUTE = "openai";
+  const T0 = Date.now();
+  const TIMEOUT = routeTimeoutMs(ROUTE);
+  const { harness, cap: HARNESS_CAP } = harnessCapFor(req);
   const openaiOn = CFG.enableOpenAI.present ? !!CFG.enableOpenAI.value : true;
   if (!openaiOn) {
     stats.errors++;
@@ -603,7 +681,8 @@ async function handleChatCompletions(req, res, body, requestId) {
   const deepSearch = !!(body.deepSearch ?? body.deep_search);
   // Límite profesional: el worker ignora max_tokens; FMP trunca y avisa
   // con finish length (igual que API nativa). Default 4096.
-  const maxTokens = effMaxTokens(body.max_tokens ?? body.max_completion_tokens, 4096);
+  // Per-harness cap (HARDENING-001): min(global ceil, FMP_HARNESS_LIMITS[harness]).
+  const maxTokens = Math.min(effMaxTokens(body.max_tokens ?? body.max_completion_tokens, 4096), HARNESS_CAP);
   // stream_mode full: bufferiza íntegro y luego emite SSE (para rachas
   // malas de upstream). Default live, como API nativa.
   const fullMode = body.stream_mode === "full";
@@ -611,6 +690,7 @@ async function handleChatCompletions(req, res, body, requestId) {
   const id = "chatcmpl-" + rid();
   const created = Math.floor(Date.now() / 1000);
   const logTag = `OAI/${model}/${id.slice(-6)}`;
+  if (harness !== "unknown") trace(`${logTag} HARNESS=${harness} cap=${HARNESS_CAP}`);
 
   // Puente tool-use (TRANSPORTE, no ejecución): si el cliente declara
   // tools, pedir EXEC::: al worker. FMP nunca ejecuta la herramienta;
@@ -625,10 +705,10 @@ async function handleChatCompletions(req, res, body, requestId) {
   // Obtiene texto íntegro (SSE + retry + fallback JSON). Reutilizado
   // por ramas stream y no-stream.
   async function getOAIText() {
-    const r = await fetchCompleteText({ messages: wm, modelId: model, thinking, deepSearch, signal: null, logTag });
+    const r = await fetchCompleteText({ messages: wm, modelId: model, thinking, deepSearch, signal: null, logTag, route: ROUTE, timeoutMs: TIMEOUT });
     if (r.complete) return { text: r.text, complete: true, finish: "stop" };
     try {
-      const ju = await callUpstream({ messages: wm, modelId: model, stream: false, thinking, deepSearch, signal: null });
+      const ju = await callUpstream({ messages: wm, modelId: model, stream: false, thinking, deepSearch, signal: null, timeoutMs: TIMEOUT, route: ROUTE });
       const jtext = await readWorkerJson(ju);
       if (jtext.length >= r.text.length && jtext.length > 0) {
         trace(`${logTag} FALLBACK-OK chars=${jtext.length}`);
@@ -641,17 +721,18 @@ async function handleChatCompletions(req, res, body, requestId) {
     }
   }
 
+  const routeErr = () => { stats.errors++; usage[tier].errors++; routeMetrics[ROUTE].errors++; };
   if (!stream) {
     let got;
     try {
       got = await getOAIText();
     } catch (e) {
-      stats.errors++;
-      usage[tier].errors++;
+      routeErr();
       release();
       const s = SEC.sanitizeUpstreamError(e, requestId);
       return openaiError(res, s.status, s.message, "upstream_error", req);
     }
+    recordLatency(ROUTE, Date.now() - T0);
     usage[tier].tokens += estTokens(got.text);
     const capped = applyMaxTokens(got.text, maxTokens);
     if (capped.hit) trace(`${logTag} MAXTOKENS cut=${got.text.length}->${capped.text.length}`);
@@ -700,12 +781,12 @@ async function handleChatCompletions(req, res, body, requestId) {
     try {
       got = await getOAIText();
     } catch (e) {
-      stats.errors++;
-      usage[tier].errors++;
+      routeErr();
       release();
       const s = SEC.sanitizeUpstreamError(e, requestId);
       return openaiError(res, s.status, s.message, "upstream_error", req);
     }
+    recordLatency(ROUTE, Date.now() - T0);
     const capped = applyMaxTokens(got.text, maxTokens);
     if (capped.hit) trace(`${logTag} MAXTOKENS cut=${got.text.length}->${capped.text.length}`);
     const ftext = capped.text;
@@ -725,6 +806,7 @@ async function handleChatCompletions(req, res, body, requestId) {
     return res.end();
   }
   res.writeHead(200, sseHeaders(req));
+  const stopHeartbeat = startHeartbeat(res, req, logTag);
   const send = (obj) => res.write("data: " + JSON.stringify(obj) + "\n\n");
   let closed = false;
   req.on("close", () => { closed = true; });
@@ -754,13 +836,20 @@ async function handleChatCompletions(req, res, body, requestId) {
     attempts = a + 1;
     let upstream;
     try {
-      upstream = await callUpstream({ messages: wm, modelId: model, stream: true, thinking, deepSearch, signal: ctrl.signal });
+      upstream = await callUpstream({ messages: wm, modelId: model, stream: true, thinking, deepSearch, signal: ctrl.signal, timeoutMs: TIMEOUT, route: ROUTE });
     } catch (e) {
       if (emitted || a === MAX_RETRIES) {
-        if (!closed && !emitted) send({ id, object: "chat.completion.chunk", created, model, choices: [{ index: 0, delta: {}, finish_reason: "error" }] });
+        // Explicit stream error (never silent): error chunk carries code,
+        // then honest close. Client sees failure, not a hang.
+        if (!closed && !emitted) {
+          send({ id, object: "chat.completion.chunk", created, model, choices: [{ index: 0, delta: {}, finish_reason: "error" }] });
+          const s = SEC.sanitizeUpstreamError(e, requestId);
+          trace(`${logTag} LIVE FAILED status=${s.status} request_id=${requestId}`);
+        }
         break;
       }
       stats.retries++;
+      routeMetrics[ROUTE].retries++;
       trace(`${logTag} LIVE upstream-error attempt=${attempts} err=${e.message}`);
       await sleep(RETRY_BASE_MS * (a + 1));
       continue;
@@ -788,6 +877,7 @@ async function handleChatCompletions(req, res, body, requestId) {
           trace(`${logTag} LIVE CAPPED emitted=${emitted.length} -> close length`);
         } else {
           stats.truncatedUpstream++;
+          routeMetrics[ROUTE].truncations++;
           trace(`${logTag} LIVE DIVERGED emitted=${emitted.length} -> close honest`);
         }
         break;
@@ -795,6 +885,7 @@ async function handleChatCompletions(req, res, body, requestId) {
     } catch (e) {
       if (emitted || a === MAX_RETRIES) break;
       stats.retries++;
+      routeMetrics[ROUTE].retries++;
       trace(`${logTag} LIVE read-error attempt=${attempts} err=${e.message}`);
       await sleep(RETRY_BASE_MS * (a + 1));
       continue;
@@ -808,16 +899,20 @@ async function handleChatCompletions(req, res, body, requestId) {
       break;
     }
     stats.truncatedUpstream++;
+    routeMetrics[ROUTE].truncations++;
     if (!emitted) {
       // Nada emitido: reintento seguro.
       trace(`${logTag} LIVE TRUNCATED attempt=${attempts} nothing-emitted -> retry`);
       stats.retries++;
+      routeMetrics[ROUTE].retries++;
       if (a < MAX_RETRIES) await sleep(RETRY_BASE_MS * (a + 1));
       continue;
     }
     trace(`${logTag} LIVE TRUNCATED attempt=${attempts} emitted=${emitted.length} -> close honest`);
     break;
   }
+  stopHeartbeat();
+  recordLatency(ROUTE, Date.now() - T0);
   if (!closed) {
     // Sin rescate por continuación: el worker reescribe el borde en vez
     // de continuar (evidencia), así que cualquier pegado sería
@@ -983,11 +1078,11 @@ function agentSystemPrompt(tools) {
   ].join("\n");
 }
 
-async function resolveResponsesText(body, workerMessages, model, logTag) {
+async function resolveResponsesText(body, workerMessages, model, logTag, route, timeoutMs) {
   const thinking = !!body.thinking;
   let result;
   try {
-    result = await fetchCompleteText({ messages: workerMessages, modelId: model, thinking, deepSearch: false, signal: null, logTag });
+    result = await fetchCompleteText({ messages: workerMessages, modelId: model, thinking, deepSearch: false, signal: null, logTag, route, timeoutMs });
   } catch (e) {
     stats.errors++;
     throw e;
@@ -996,7 +1091,7 @@ async function resolveResponsesText(body, workerMessages, model, logTag) {
   if (!result.complete) {
     try {
       trace(`${logTag} FALLBACK-JSON charsSoFar=${result.text.length}`);
-      const ju = await callUpstream({ messages: workerMessages, modelId: model, stream: false, thinking, deepSearch: false, signal: null });
+      const ju = await callUpstream({ messages: workerMessages, modelId: model, stream: false, thinking, deepSearch: false, signal: null, timeoutMs, route });
       const jtext = await readWorkerJson(ju);
       if (jtext.length >= result.text.length && jtext.length > 0) {
         result = { text: jtext, attempts: result.attempts + 1, complete: true, aborted: false };
@@ -1014,6 +1109,11 @@ async function resolveResponsesText(body, workerMessages, model, logTag) {
 
 async function handleResponses(req, res, body, requestId) {
   stats.requests++;
+  const ROUTE = "responses";
+  const TIMEOUT = routeTimeoutMs(ROUTE);
+  const { harness, cap: HARNESS_CAP } = harnessCapFor(req);
+  const routeErr = () => { stats.errors++; usage[tier].errors++; routeMetrics[ROUTE].errors++; };
+  const T0 = Date.now();
   // Responses API: experimental, disabled by default (Phase 2).
   const rspOn = CFG.enableResponses.present ? !!CFG.enableResponses.value : false;
   if (!rspOn) {
@@ -1046,6 +1146,7 @@ async function handleResponses(req, res, body, requestId) {
   if (typeof body.model !== "string" || !stripPrefix(body.model)) {
     return done(() => {
       stats.errors++;
+      routeMetrics[ROUTE].errors++;
       return sendJson(res, 400, {
         error: { message: "model is required: request must explicitly select an alias (no ambient fallback)", type: "invalid_request_error", code: "model_required" },
       }, req);
@@ -1055,6 +1156,7 @@ async function handleResponses(req, res, body, requestId) {
   if (!MODELS_LIB.isKnown(model)) {
     return done(() => {
       stats.errors++;
+      routeMetrics[ROUTE].errors++;
       return sendJson(res, 404, {
         error: { message: `model '${body.model}' not found. Valid: ${[...MODEL_IDS].join(", ")}`, type: "invalid_request_error", code: "model_not_found" },
       }, req);
@@ -1063,6 +1165,7 @@ async function handleResponses(req, res, body, requestId) {
   if (KILL_ALL || DISABLED_MODELS.has(model)) {
     return done(() => {
       stats.errors++;
+      routeMetrics[ROUTE].errors++;
       usage[tier].errors++;
       return sendJson(res, 503, {
         error: { message: `model '${model}' unavailable (kill switch / disabled alias)`, type: "server_error", code: "alias_disabled" },
@@ -1127,7 +1230,8 @@ async function handleResponses(req, res, body, requestId) {
   }
   let resolved;
   try {
-    resolved = await resolveResponsesText(body, workerMessages, model, logTag);
+    if (harness !== "unknown") trace(`${logTag} HARNESS=${harness} cap=${HARNESS_CAP}`);
+    resolved = await resolveResponsesText(body, workerMessages, model, logTag, ROUTE, TIMEOUT);
   } catch (e) {
     return done(() => {
       const s = SEC.sanitizeUpstreamError(e, requestId);
@@ -1169,6 +1273,7 @@ async function handleResponses(req, res, body, requestId) {
   const outputItem = outputItems[outputItems.length - 1];
 
   if (!stream) {
+    recordLatency(ROUTE, Date.now() - T0);
     usage[body.__tier].tokens += estTokens(result.text);
   trace(`${logTag} SERVED chars=${result.text.length} status=${rspStatus} toolCall=${toolCall ? toolCall.name : "-"} elapsed=${Date.now() - t0}ms`);
   try { body.__release(); } catch {}
@@ -1180,6 +1285,7 @@ async function handleResponses(req, res, body, requestId) {
   }
 
   res.writeHead(200, sseHeaders(req));
+  const stopHeartbeat = startHeartbeat(res, req, logTag);
   const send = (ev, d) => res.write("event: " + ev + "\ndata: " + JSON.stringify(d) + "\n\n");
   let closed = false;
   req.on("close", () => { closed = true; });
@@ -1220,6 +1326,8 @@ async function handleResponses(req, res, body, requestId) {
       });
     }
     usage[body.__tier].tokens += estTokens(result.text);
+  stopHeartbeat();
+  recordLatency(ROUTE, Date.now() - T0);
   trace(`${logTag} SERVED-FC name=${fcItem.name} elapsed=${Date.now() - t0}ms`);
   try { body.__release(); } catch {}
     return res.end();
@@ -1247,6 +1355,8 @@ async function handleResponses(req, res, body, requestId) {
     });
   }
   usage[body.__tier].tokens += estTokens(result.text);
+  stopHeartbeat();
+  recordLatency(ROUTE, Date.now() - T0);
   trace(`${logTag} SERVED chars=${result.text.length} status=${rspStatus} elapsed=${Date.now() - t0}ms`);
   try { body.__release(); } catch {}
   res.end();
@@ -1254,6 +1364,10 @@ async function handleResponses(req, res, body, requestId) {
 
 async function handleMessages(req, res, body, requestId) {
   stats.requests++;
+  const ROUTE = "anthropic";
+  const TIMEOUT = routeTimeoutMs(ROUTE);
+  const { harness, cap: HARNESS_CAP } = harnessCapFor(req);
+  const routeErr = () => { stats.errors++; usage[tier].errors++; routeMetrics[ROUTE].errors++; };
   const anthropicOn = CFG.enableAnthropic.present ? !!CFG.enableAnthropic.value : true;
   if (!anthropicOn) {
     stats.errors++;
@@ -1296,7 +1410,7 @@ async function handleMessages(req, res, body, requestId) {
     return anthropicError(res, 400, "invalid tool_choice: must be a string or object", req);
   }
   const antDefs = antCheck.defs;
-  const maxTokens = effMaxTokens(body.max_tokens, 1024);
+  const maxTokens = Math.min(effMaxTokens(body.max_tokens, 1024), HARNESS_CAP);
   const workerMessages = toWorkerMessagesAnt(body.system, body.messages);
   if (!workerMessages.length) { release(); stats.errors++; return anthropicError(res, 400, "messages required", req); }
   const stream = body.stream === true;
@@ -1307,6 +1421,8 @@ async function handleMessages(req, res, body, requestId) {
   const msgId = "msg_" + rid();
   const inputTokens = estTokens(JSON.stringify(workerMessages));
   const logTag = `ANT/${model}/${msgId.slice(-6)}`;
+  if (harness !== "unknown") trace(`${logTag} HARNESS=${harness} cap=${HARNESS_CAP}`);
+  const T0 = Date.now();
   // Límite profesional (igual que OAI): worker ignora max_tokens.
 
   // Puente tool-use Anthropic: tools [{name, description, input_schema}]
@@ -1326,21 +1442,21 @@ async function handleMessages(req, res, body, requestId) {
   if (fullMode && stream) {
     let got;
     try {
-      const r = await fetchCompleteText({ messages: wmAnt, modelId: model, thinking, deepSearch: false, signal: null, logTag });
+      const r = await fetchCompleteText({ messages: wmAnt, modelId: model, thinking, deepSearch: false, signal: null, logTag, route: ROUTE, timeoutMs: TIMEOUT });
       got = r.complete ? r.text : (await (async () => {
         try {
-          const ju = await callUpstream({ messages: wmAnt, modelId: model, stream: false, thinking, deepSearch: false, signal: null });
+          const ju = await callUpstream({ messages: wmAnt, modelId: model, stream: false, thinking, deepSearch: false, signal: null, timeoutMs: TIMEOUT, route: ROUTE });
           const jt = await readWorkerJson(ju);
           return jt.length >= r.text.length && jt.length > 0 ? jt : r.text;
         } catch { return r.text; }
       })());
     } catch (e) {
-      stats.errors++;
-      usage[tier].errors++;
+      routeErr();
       release();
       const s = SEC.sanitizeUpstreamError(e, requestId);
       return anthropicError(res, s.status, s.message, req);
     }
+    recordLatency(ROUTE, Date.now() - T0);
     const capped = applyMaxTokens(got, maxTokens);
     if (capped.hit) trace(`${logTag} MAXTOKENS cut=${got.length}->${capped.text.length}`);
     const ftext = capped.hit ? capped.text : got;
@@ -1366,21 +1482,21 @@ async function handleMessages(req, res, body, requestId) {
   if (!stream) {
     let got;
     try {
-      const r = await fetchCompleteText({ messages: wmAnt, modelId: model, thinking, deepSearch: false, signal: null, logTag });
+      const r = await fetchCompleteText({ messages: wmAnt, modelId: model, thinking, deepSearch: false, signal: null, logTag, route: ROUTE, timeoutMs: TIMEOUT });
       got = r.complete ? r.text : (await (async () => {
         try {
-          const ju = await callUpstream({ messages: wmAnt, modelId: model, stream: false, thinking, deepSearch: false, signal: null });
+          const ju = await callUpstream({ messages: wmAnt, modelId: model, stream: false, thinking, deepSearch: false, signal: null, timeoutMs: TIMEOUT, route: ROUTE });
           const jt = await readWorkerJson(ju);
           return jt.length >= r.text.length && jt.length > 0 ? jt : r.text;
         } catch { return r.text; }
       })());
     } catch (e) {
-      stats.errors++;
-      usage[tier].errors++;
+      routeErr();
       release();
       const s = SEC.sanitizeUpstreamError(e, requestId);
       return anthropicError(res, s.status, s.message, req);
     }
+    recordLatency(ROUTE, Date.now() - T0);
     usage[tier].tokens += estTokens(got);
     const cappedAnt = applyMaxTokens(got, maxTokens);
     if (cappedAnt.hit) trace(`${logTag} MAXTOKENS cut=${got.length}->${cappedAnt.text.length}`);
@@ -1413,6 +1529,7 @@ async function handleMessages(req, res, body, requestId) {
 
   // STREAM EN VIVO Anthropic: text_delta en cuanto llega + resume.
   res.writeHead(200, sseHeaders(req));
+  const stopHeartbeat = startHeartbeat(res, req, logTag);
   const send = (obj) => res.write("event: " + obj._ev + "\ndata: " + JSON.stringify(obj._d) + "\n\n");
   let closed = false;
   req.on("close", () => { closed = true; });
@@ -1444,10 +1561,16 @@ async function handleMessages(req, res, body, requestId) {
     attempts = a + 1;
     let upstream;
     try {
-      upstream = await callUpstream({ messages: wmAnt, modelId: model, stream: true, thinking, deepSearch: false, signal: ctrl.signal });
+      upstream = await callUpstream({ messages: wmAnt, modelId: model, stream: true, thinking, deepSearch: false, signal: ctrl.signal, timeoutMs: TIMEOUT, route: ROUTE });
     } catch (e) {
-      if (emitted || a === MAX_RETRIES) break;
+      if (emitted || a === MAX_RETRIES) {
+        // Explicit stream error (never silent): honest close below carries
+        // max_tokens/end_turn; trace records the failure with request id.
+        if (!closed && !emitted) trace(`${logTag} LIVE FAILED request_id=${requestId}`);
+        break;
+      }
       stats.retries++;
+      routeMetrics[ROUTE].retries++;
       trace(`${logTag} LIVE upstream-error attempt=${attempts} err=${e.message}`);
       await sleep(RETRY_BASE_MS * (a + 1));
       continue;
@@ -1468,6 +1591,7 @@ async function handleMessages(req, res, body, requestId) {
           trace(`${logTag} LIVE CAPPED emitted=${emitted.length} -> close length`);
         } else {
           stats.truncatedUpstream++;
+          routeMetrics[ROUTE].truncations++;
           trace(`${logTag} LIVE DIVERGED emitted=${emitted.length} -> close honest`);
         }
         break;
@@ -1480,9 +1604,11 @@ async function handleMessages(req, res, body, requestId) {
         break;
       }
       stats.truncatedUpstream++;
+      routeMetrics[ROUTE].truncations++;
       if (!emitted) {
         trace(`${logTag} LIVE TRUNCATED attempt=${attempts} nothing-emitted -> retry`);
         stats.retries++;
+        routeMetrics[ROUTE].retries++;
         if (a < MAX_RETRIES) await sleep(RETRY_BASE_MS * (a + 1));
         continue;
       }
@@ -1491,10 +1617,13 @@ async function handleMessages(req, res, body, requestId) {
     } catch (e) {
       if (emitted || a === MAX_RETRIES) break;
       stats.retries++;
+      routeMetrics[ROUTE].retries++;
       trace(`${logTag} LIVE read-error attempt=${attempts} err=${e.message}`);
       await sleep(RETRY_BASE_MS * (a + 1));
     }
   }
+  stopHeartbeat();
+  recordLatency(ROUTE, Date.now() - T0);
   if (!closed) {
     // Sin rescate por continuación (ver nota OAI): cierre honesto.
     // Cap de max_tokens -> max_tokens (como API nativa).
