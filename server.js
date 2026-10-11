@@ -928,21 +928,25 @@ async function handleChatCompletions(req, res, body, requestId) {
         let cont;
         try {
           const contUp = await callUpstream({ messages: contMsgs, modelId: model, stream: true, thinking, deepSearch, signal: ctrl.signal, timeoutMs: TIMEOUT, route: ROUTE });
-          cont = await readWorkerSSELive(contUp, async (piece) => {
-            if (!closed) emitNovel(piece);
-          }, ctrl.signal);
+          // Collect WITHOUT emitting: merge decision first, emit once.
+          cont = await readWorkerSSELive(contUp, null, ctrl.signal);
         } catch (e) {
           trace(`${logTag} LIVE CONTINUE-FAIL err=${String((e && e.message) || e).slice(0, 120)} -> close honest`);
           break;
         }
         const merged = dedupeAppend(emitted, cont.text);
+        const novel = merged.slice(emitted.length);
         if (merged.length <= emitted.length + 8 && !cont.done) {
           trace(`${logTag} LIVE CONTINUE-STALLED total=${emitted.length} -> close honest`);
           break;
         }
+        if (novel && !closed && !cappedHit) {
+          emitted += novel;
+          for (let k = 0; k < novel.length; k += 48) {
+            send({ id, object: "chat.completion.chunk", created, model, choices: [{ index: 0, delta: { content: novel.slice(k, k + 48) }, finish_reason: null }] });
+          }
+        }
         if (cont.done) {
-          const rest = merged.slice(emitted.length);
-          if (rest && !closed) emitNovel(rest);
           complete = !cappedHit;
           continued = true;
           trace(`${logTag} LIVE CONTINUE-OK total=${emitted.length}`);
@@ -1692,22 +1696,29 @@ async function handleMessages(req, res, body, requestId) {
         let cont;
         try {
           const contUp = await callUpstream({ messages: contMsgs, modelId: model, stream: true, thinking, deepSearch: false, signal: ctrl.signal, timeoutMs: TIMEOUT, route: ROUTE });
-          cont = await readWorkerSSELive(contUp, async (piece) => {
-            if (!closed) emitAnt(piece);
-          }, ctrl.signal);
+          // Collect WITHOUT emitting: merge decision first, emit once.
+          // (Emitting inside the callback then slicing merged text would
+          // always yield empty rest — the merge must precede emission.)
+          cont = await readWorkerSSELive(contUp, null, ctrl.signal);
         } catch (e) {
           trace(`${logTag} LIVE CONTINUE-FAIL err=${String((e && e.message) || e).slice(0, 120)} -> close honest`);
           break;
         }
         const merged = dedupeAppend(emitted, cont.text);
+        const novel = merged.slice(emitted.length);
         if (merged.length <= emitted.length + 8 && !cont.done) {
           // No progress and no DONE: further rounds would loop.
           trace(`${logTag} LIVE CONTINUE-STALLED total=${emitted.length} -> close honest`);
           break;
         }
+        if (novel && !closed) {
+          if (cappedHit) break;
+          emitted += novel;
+          for (let k = 0; k < novel.length; k += 48) {
+            send(ev("content_block_delta", { type: "content_block_delta", index: 0, delta: { type: "text_delta", text: novel.slice(k, k + 48) } }));
+          }
+        }
         if (cont.done) {
-          const rest = merged.slice(emitted.length);
-          if (rest && !closed) emitAnt(rest);
           complete = !cappedHit;
           continued = true;
           trace(`${logTag} LIVE CONTINUE-OK total=${emitted.length}`);
