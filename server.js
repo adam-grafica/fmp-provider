@@ -910,7 +910,40 @@ async function handleChatCompletions(req, res, body, requestId) {
       if (a < MAX_RETRIES) await sleep(RETRY_BASE_MS * (a + 1));
       continue;
     }
-    trace(`${logTag} LIVE TRUNCATED attempt=${attempts} emitted=${emitted.length} -> close honest`);
+    // CONTINUATION (stability-006, igual que Anthropic): una ronda extra
+    // con la cola emitida como contexto mantiene el SSE abierto y cierra
+    // en stop, no en length. Acotado por MAX_RETRIES; sin solapamiento
+    // no se pega nada (cierre honesto).
+    if (a < MAX_RETRIES) {
+      trace(`${logTag} LIVE CONTINUE attempt=${attempts} emitted=${emitted.length}`);
+      stats.retries++;
+      routeMetrics[ROUTE].retries++;
+      const tail = emitted.slice(-500);
+      const contMsgs = wm.concat([
+        { role: "assistant", content: tail },
+        { role: "user", content: "Continúa exactamente donde quedaste, sin repetir ni resumir." },
+      ]);
+      try {
+        const contUp = await callUpstream({ messages: contMsgs, modelId: model, stream: true, thinking, deepSearch, signal: ctrl.signal, timeoutMs: TIMEOUT, route: ROUTE });
+        const cont = await readWorkerSSELive(contUp, async (piece) => {
+          if (!closed) emitNovel(piece);
+        }, ctrl.signal);
+        if (cont.done) {
+          const rest = dedupeAppend(emitted, cont.text).slice(emitted.length);
+          if (rest && !closed) emitNovel(rest);
+          complete = !cappedHit;
+          trace(`${logTag} LIVE CONTINUE-OK total=${emitted.length}`);
+          break;
+        }
+        stats.truncatedUpstream++;
+        routeMetrics[ROUTE].truncations++;
+        trace(`${logTag} LIVE CONTINUE-CUT total=${emitted.length} -> close honest`);
+      } catch (e) {
+        trace(`${logTag} LIVE CONTINUE-FAIL err=${String((e && e.message) || e).slice(0, 120)} -> close honest`);
+      }
+    } else {
+      trace(`${logTag} LIVE TRUNCATED attempt=${attempts} emitted=${emitted.length} -> close honest`);
+    }
     break;
   }
   stopHeartbeat();
@@ -1607,24 +1640,60 @@ async function handleMessages(req, res, body, requestId) {
         }
         break;
       }
-      if (ctrl.signal.aborted || closed) break;
-      if (chunk.done) {
-        const rest = dedupeAppend(emitted, chunk.text).slice(emitted.length);
-        if (rest && !closed) emitAnt(rest);
-        complete = !cappedHit;
-        break;
-      }
-      stats.truncatedUpstream++;
-      routeMetrics[ROUTE].truncations++;
-      if (!emitted) {
-        trace(`${logTag} LIVE TRUNCATED attempt=${attempts} nothing-emitted -> retry`);
-        stats.retries++;
-        routeMetrics[ROUTE].retries++;
-        if (a < MAX_RETRIES) await sleep(RETRY_BASE_MS * (a + 1));
-        continue;
-      }
-      trace(`${logTag} LIVE TRUNCATED attempt=${attempts} emitted=${emitted.length} -> close honest`);
+    if (ctrl.signal.aborted || closed) break;
+    if (chunk.done) {
+      const rest = dedupeAppend(emitted, chunk.text).slice(emitted.length);
+      if (rest && !closed) emitAnt(rest);
+      complete = !cappedHit;
       break;
+    }
+    stats.truncatedUpstream++;
+    routeMetrics[ROUTE].truncations++;
+    if (!emitted) {
+      trace(`${logTag} LIVE TRUNCATED attempt=${attempts} nothing-emitted -> retry`);
+      stats.retries++;
+      routeMetrics[ROUTE].retries++;
+      if (a < MAX_RETRIES) await sleep(RETRY_BASE_MS * (a + 1));
+      continue;
+    }
+    // CONTINUATION (stability-006): upstream cut mid-stream but the client
+    // is still attached. Re-request with the emitted tail as context and
+    // keep the SAME SSE block open — the SDK sees one continuous stream
+    // ending in end_turn, not a max_tokens stop (which it misreads as a
+    // 128k overflow error). Bounded by MAX_RETRIES; honest max_tokens
+    // close only when rounds exhaust. No Frankenstein: continuation text
+    // is appended only on tail-overlap, else we close honestly.
+    if (a < MAX_RETRIES) {
+      trace(`${logTag} LIVE CONTINUE attempt=${attempts} emitted=${emitted.length}`);
+      stats.retries++;
+      routeMetrics[ROUTE].retries++;
+      const tail = emitted.slice(-500);
+      const contMsgs = wmAnt.concat([
+        { role: "assistant", content: tail },
+        { role: "user", content: "Continúa exactamente donde quedaste, sin repetir ni resumir." },
+      ]);
+      try {
+        const contUp = await callUpstream({ messages: contMsgs, modelId: model, stream: true, thinking, deepSearch: false, signal: ctrl.signal, timeoutMs: TIMEOUT, route: ROUTE });
+        const cont = await readWorkerSSELive(contUp, async (piece) => {
+          if (!closed) emitAnt(piece);
+        }, ctrl.signal);
+        if (cont.done) {
+          const rest = dedupeAppend(emitted, cont.text).slice(emitted.length);
+          if (rest && !closed) emitAnt(rest);
+          complete = !cappedHit;
+          trace(`${logTag} LIVE CONTINUE-OK total=${emitted.length}`);
+          break;
+        }
+        stats.truncatedUpstream++;
+        routeMetrics[ROUTE].truncations++;
+        trace(`${logTag} LIVE CONTINUE-CUT total=${emitted.length} -> close honest`);
+      } catch (e) {
+        trace(`${logTag} LIVE CONTINUE-FAIL err=${String((e && e.message) || e).slice(0, 120)} -> close honest`);
+      }
+    } else {
+      trace(`${logTag} LIVE TRUNCATED attempt=${attempts} emitted=${emitted.length} -> close honest`);
+    }
+    break;
     } catch (e) {
       if (emitted || a === MAX_RETRIES) break;
       stats.retries++;
