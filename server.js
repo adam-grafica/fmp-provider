@@ -285,7 +285,12 @@ function textOfContent(content) {
       if (p && typeof p === "object") {
         if (typeof p.text === "string") return p.text;
         if (p.type === "image_url" || p.type === "image") return "";
-        if (p.type === "tool_result") return typeof p.output === "string" ? p.output : JSON.stringify(p.output ?? "");
+        if (p.type === "tool_result") {
+          const raw = p.content !== undefined ? p.content : p.output;
+          if (typeof raw === "string") return raw;
+          if (Array.isArray(raw)) return textOfContent(raw);
+          return JSON.stringify(raw ?? "");
+        }
         if (p.type === "tool_use") return "";
         return "";
       }
@@ -295,15 +300,40 @@ function textOfContent(content) {
   return String(content);
 }
 
+// Inyecta instrucciones del sistema/tools como prefijo del primer user message
+// porque el upstream worker descarta en silencio los mensajes con role: "system".
+function injectSystemToFirstUser(messages, systemParts) {
+  const sysText = (systemParts || []).filter(Boolean).join("\n\n").trim();
+  if (!sysText) return messages;
+  const out = [...messages];
+  const firstUserIdx = out.findIndex((m) => m.role === "user");
+  const block = `[INSTRUCCIONES DEL SISTEMA / HERRAMIENTAS]\n${sysText}\n[/INSTRUCCIONES DEL SISTEMA]\n\n`;
+  if (firstUserIdx >= 0) {
+    out[firstUserIdx] = {
+      ...out[firstUserIdx],
+      content: block + out[firstUserIdx].content,
+    };
+  } else {
+    out.unshift({ role: "user", content: block.trim() });
+  }
+  return out;
+}
+
 function toWorkerMessagesOA(messages) {
-  const out = [];
+  const raw = [];
+  const systemParts = [];
   for (const m of messages || []) {
     if (!m || typeof m !== "object") continue;
-    if (m.role === "tool") {
-      out.push({ role: "user", content: `[resultado de herramienta ${m.tool_call_id || ""}]\n${textOfContent(m.content)}`.trim() });
+    if (m.role === "system") {
+      const s = textOfContent(m.content).trim();
+      if (s) systemParts.push(s);
       continue;
     }
-    const role = m.role === "system" || m.role === "user" || m.role === "assistant" ? m.role : "user";
+    if (m.role === "tool") {
+      raw.push({ role: "user", content: `[resultado de herramienta ${m.tool_call_id || ""}]\n${textOfContent(m.content)}`.trim() });
+      continue;
+    }
+    const role = m.role === "assistant" ? "assistant" : "user";
     let text = textOfContent(m.content);
     if (role === "assistant" && Array.isArray(m.tool_calls) && m.tool_calls.length) {
       for (const tc of m.tool_calls) {
@@ -312,23 +342,43 @@ function toWorkerMessagesOA(messages) {
       }
       text = text.trim();
     }
-    out.push({ role, content: text });
+    raw.push({ role, content: text });
   }
-  return out;
+  return injectSystemToFirstUser(raw, systemParts);
 }
 
 function toWorkerMessagesAnt(system, messages) {
-  const out = [];
-  if (typeof system === "string" && system) out.push({ role: "system", content: system });
+  const raw = [];
+  const systemParts = [];
+  if (typeof system === "string" && system.trim()) systemParts.push(system.trim());
   else if (Array.isArray(system)) {
-    const t = textOfContent(system);
-    if (t) out.push({ role: "system", content: t });
+    const t = textOfContent(system).trim();
+    if (t) systemParts.push(t);
   }
   for (const m of messages || []) {
     if (!m || typeof m !== "object") continue;
-    // tool_result -> worker lo ve como dato del usuario.
-    if (m.role === "tool" || m.role === "user" || (m.role !== "assistant" && m.type === "tool_result")) {
-      out.push({ role: "user", content: textOfContent(m.content) });
+    if (m.role === "system") {
+      const s = textOfContent(m.content).trim();
+      if (s) systemParts.push(s);
+      continue;
+    }
+    // tool_result -> worker lo ve como dato del usuario con id identificado.
+    if (m.role === "tool" || (m.role === "user" && Array.isArray(m.content) && m.content.some((p) => p && p.type === "tool_result"))) {
+      let toolResults = [];
+      if (Array.isArray(m.content)) {
+        for (const p of m.content) {
+          if (p && p.type === "tool_result") {
+            const rawRes = p.content !== undefined ? p.content : p.output;
+            const resStr = typeof rawRes === "string" ? rawRes : (Array.isArray(rawRes) ? textOfContent(rawRes) : JSON.stringify(rawRes ?? ""));
+            toolResults.push(`[resultado de herramienta ${p.tool_use_id || ""}]:\n${resStr}`);
+          } else if (p && p.text) {
+            toolResults.push(p.text);
+          }
+        }
+      } else {
+        toolResults.push(textOfContent(m.content));
+      }
+      raw.push({ role: "user", content: toolResults.join("\n\n").trim() });
       continue;
     }
     const role = m.role === "assistant" ? "assistant" : "user";
@@ -339,9 +389,9 @@ function toWorkerMessagesAnt(system, messages) {
       for (const u of uses) text += `\n[llamada a herramienta ${u.name || ""}] ${JSON.stringify(u.input || {})}`;
       text = text.trim();
     }
-    out.push({ role, content: text });
+    raw.push({ role, content: text });
   }
-  return out;
+  return injectSystemToFirstUser(raw, systemParts);
 }
 
 async function callUpstream({ messages, modelId, stream, thinking, deepSearch, signal, timeoutMs, route }) {
@@ -696,11 +746,9 @@ async function handleChatCompletions(req, res, body, requestId) {
   // tools, pedir EXEC::: al worker. FMP nunca ejecuta la herramienta;
   // el harness cliente ejecuta y devuelve el resultado.
   const oaiTools = Array.isArray(body.tools) ? body.tools : [];
-  let wm = workerMessages;
-  if (oaiDefs.length && body.tool_choice !== "none") {
-    const sys = agentSystemPrompt(oaiTools);
-    if (sys) wm = [{ role: "system", content: sys }, ...workerMessages];
-  }
+  const oaiToolSys = (oaiDefs.length && body.tool_choice !== "none") ? agentSystemPrompt(oaiTools) : "";
+  const oaiInputMsgs = oaiToolSys ? [{ role: "system", content: oaiToolSys }, ...(body.messages || [])] : (body.messages || []);
+  const wm = toWorkerMessagesOA(oaiInputMsgs);
 
   // Obtiene texto íntegro (SSE + retry + fallback JSON). Reutilizado
   // por ramas stream y no-stream.
@@ -973,7 +1021,16 @@ async function handleChatCompletions(req, res, body, requestId) {
     // cap de max_tokens->length (como API nativa).
     let finalReason = cappedHit ? "length" : (complete ? "stop" : "length");
     // Puente tool-use post-stream (solo si el texto final trae EXEC).
-    const tcLive = oaiDefs.length ? parseToolCall(emitted, oaiDefs) : null;
+    let tcLive = oaiDefs.length ? parseToolCall(emitted, oaiDefs) : null;
+    if (!tcLive && oaiDefs.length) {
+      const shellCmd = extractShellBlock(emitted);
+      const execTool = (oaiDefs || []).find((t) => t.name === "exec_command" || t.name === "Bash");
+      if (shellCmd && execTool) {
+        const toolName = execTool.name;
+        const args = toolName === "Bash" ? { command: shellCmd } : { cmd: shellCmd };
+        tcLive = { name: toolName, args: JSON.stringify(args) };
+      }
+    }
     if (tcLive) {
       const tcId = "call_" + rid().slice(0, 20);
       send({ id, object: "chat.completion.chunk", created, model, choices: [{ index: 0, delta: { tool_calls: [{ index: 0, id: tcId, type: "function", function: { name: tcLive.name, arguments: tcLive.args } }] }, finish_reason: null }] });
@@ -1084,12 +1141,14 @@ async function resolveToolCall(text, defs, wm, modelId, logTag) {
   let tc = parseToolCall(text, defs);
   if (tc) return tc;
   const shellCmd = extractShellBlock(text);
-  const execTool = (defs || []).find((t) => t.name === "exec_command");
+  const execTool = (defs || []).find((t) => t.name === "exec_command" || t.name === "Bash");
   if (shellCmd && execTool) {
     const i = text.indexOf("```");
+    const toolName = execTool.name;
+    const args = toolName === "Bash" ? { command: shellCmd } : { cmd: shellCmd };
     // Solo el NOMBRE de la tool en logs — nunca el comando (Phase 3).
-    trace(`${logTag} SHELL-BLOCK-TRANSPORT name=exec_command (transport only, not executed)`);
-    return { name: "exec_command", args: JSON.stringify({ cmd: shellCmd }), prefixText: text.slice(0, i).trim() };
+    trace(`${logTag} SHELL-BLOCK-TRANSPORT name=${toolName} (transport only, not executed)`);
+    return { name: toolName, args: JSON.stringify(args), prefixText: text.slice(0, i).trim() };
   }
   if (defs && defs.length && wm && modelId) {
     try {
@@ -1122,12 +1181,12 @@ function agentSystemPrompt(tools) {
   return [
     // Transporte, no ejecución: FMP propone la llamada; el CLIENTE
     // (harness) la ejecuta bajo sus propios permisos/aprobaciones.
-    "Tienes herramientas disponibles a través del cliente. Para PROPONER una llamada (el cliente decide si la ejecuta),",
-    "responde PRIMERO un texto breve y LUEGO en línea propia el bloque:",
+    "Tienes herramientas disponibles a través del cliente. Si necesitas ver archivos, ejecutar comandos o inspeccionar el entorno, NO respondas con teoría ni digas que no tienes acceso. En su lugar, debes PROPONER la llamada a una herramienta para que el cliente la ejecute.",
+    "Para proponer la llamada, responde con el siguiente bloque exacto en su propia línea:",
     "EXEC:::<nombre_herramienta> ARGS <json con los parámetros>",
-    "Usa SOLO estas herramientas:",
+    "Usa SOLO estas herramientas disponibles:",
     ...lines,
-    "Para comandos shell propón exec_command con {\"cmd\": \"...\"} solo si está en la lista (el cliente pide aprobación antes de ejecutar). Si no necesitas herramientas, responde normal sin bloque EXEC.",
+    "Si necesitas ejecutar comandos shell, usa la herramienta adecuada de la lista (por ejemplo Bash o exec_command). Si no necesitas herramientas, responde normal sin bloque EXEC.",
   ].join("\n");
 }
 
@@ -1481,13 +1540,11 @@ async function handleMessages(req, res, body, requestId) {
   // Puente tool-use Anthropic: tools [{name, description, input_schema}]
   // (TRANSPORTE, no ejecución — el harness cliente ejecuta).
   const antTools = Array.isArray(body.tools) ? body.tools : [];
-  let wmAnt = workerMessages;
   const antChoice = body.tool_choice;
   const antDisabled = antChoice && (antChoice.type === "none" || antChoice === "none");
-  if (antDefs.length && !antDisabled) {
-    const sys = agentSystemPrompt(antTools);
-    if (sys) wmAnt = [{ role: "system", content: sys }, ...workerMessages];
-  }
+  const antToolSys = (antDefs.length && !antDisabled) ? agentSystemPrompt(antTools) : "";
+  const combinedAntSys = [antToolSys, body.system].filter(Boolean);
+  const wmAnt = toWorkerMessagesAnt(combinedAntSys, body.messages);
 
   const t0 = Date.now();
   trace(`${logTag} START-LIVE stream=${stream} tools=${antDefs.length} thinking=${thinking}`);
@@ -1750,7 +1807,16 @@ async function handleMessages(req, res, body, requestId) {
     // Cap de max_tokens -> max_tokens (como API nativa).
     let antFinal = cappedHit ? "max_tokens" : (complete ? "end_turn" : "max_tokens");
     // Puente tool-use post-stream (solo EXEC explícito: el texto ya salió).
-    const tcLive = antDefs.length && !antDisabled ? parseToolCall(emitted, antDefs) : null;
+    let tcLive = antDefs.length && !antDisabled ? parseToolCall(emitted, antDefs) : null;
+    if (!tcLive && antDefs.length && !antDisabled) {
+      const shellCmd = extractShellBlock(emitted);
+      const execTool = (antDefs || []).find((t) => t.name === "exec_command" || t.name === "Bash");
+      if (shellCmd && execTool) {
+        const toolName = execTool.name;
+        const args = toolName === "Bash" ? { command: shellCmd } : { cmd: shellCmd };
+        tcLive = { name: toolName, args: JSON.stringify(args) };
+      }
+    }
     if (tcLive) {
       let input = {};
       try { input = JSON.parse(tcLive.args); } catch { input = {}; }

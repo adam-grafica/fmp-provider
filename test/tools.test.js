@@ -92,3 +92,12 @@ test("unit: invalid JSON args rejected", () => {
   const norm = T.openAICallsToInternal([{ id: "c1", type: "function", function: { name: "a", arguments: "{bad" } }]);
   assert.equal(norm.ok, false);
 });
+
+test("unit: multiline JSON in EXEC block parsed cleanly", () => {
+  const text = "claro\nEXEC:::View ARGS {\n  \"path\": \"package.json\"\n}\ncontinuacion";
+  const hit = T.parseExecBlock(text, [{ name: "View" }]);
+  assert.ok(hit);
+  assert.equal(hit.name, "View");
+  assert.deepEqual(hit.args, { path: "package.json" });
+  assert.equal(hit.prefixText, "claro");
+});
