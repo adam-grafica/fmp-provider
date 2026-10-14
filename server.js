@@ -1179,14 +1179,19 @@ function agentSystemPrompt(tools) {
   if (!defs.length) return "";
   const lines = defs.map((d) => `- ${d.name}: ${d.description} params=${JSON.stringify(d.params).slice(0, 800)}`);
   return [
-    // Transporte, no ejecución: FMP propone la llamada; el CLIENTE
-    // (harness) la ejecuta bajo sus propios permisos/aprobaciones.
-    "Tienes herramientas disponibles a través del cliente. Si necesitas ver archivos, ejecutar comandos o inspeccionar el entorno, NO respondas con teoría ni digas que no tienes acceso. En su lugar, debes PROPONER la llamada a una herramienta para que el cliente la ejecute.",
-    "Para proponer la llamada, responde con el siguiente bloque exacto en su propia línea:",
+    // Protocolo nativo de herramientas para el harness cliente (Claude Code / Codex / OpenCode).
+    "INSTRUCCIONES CRÍTICAS PARA HERRAMIENTAS:",
+    "Tienes herramientas reales disponibles a través del entorno. Si necesitas leer archivos, explorar carpetas o ejecutar comandos, debes invocar la herramienta correspondiente.",
+    "REGLA DE ORO: Cuando decidas invocar una herramienta, responde ÚNICAMENTE con el bloque de ejecución, SIN explicaciones previas, SIN preámbulos conversacionales, y SIN pedir disculpas.",
+    "Formato de llamada exacto (en una sola línea):",
     "EXEC:::<nombre_herramienta> ARGS <json con los parámetros>",
-    "Usa SOLO estas herramientas disponibles:",
+    "Directrices por herramienta:",
+    "- Para leer o inspeccionar archivos: USA View o Read (pasando la ruta en JSON).",
+    "- Para listar directorios o buscar archivos: USA GlobTool, LS o Read.",
+    "- Para ejecutar comandos shell en el sistema (npm, git, scripts): USA Bash con {\"command\": \"comando\"}. El comando debe ser solo código shell ejecutable, NUNCA texto conversacional ni JSON embebido.",
+    "Herramientas disponibles:",
     ...lines,
-    "Si necesitas ejecutar comandos shell, usa la herramienta adecuada de la lista (por ejemplo Bash o exec_command). Si no necesitas herramientas, responde normal sin bloque EXEC.",
+    "Si la consulta no requiere herramientas, responde normalmente en texto plano sin bloques EXEC.",
   ].join("\n");
 }
 
