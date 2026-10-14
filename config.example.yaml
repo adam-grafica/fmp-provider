@@ -43,3 +43,9 @@ fmp:
     claude-code: 4096
     antigravity: 4096
     codex: 8192
+
+# Claude Code auto-mode safety classifier fast-routing
+classifier_model: "claude-fable-5"
+classifier_match:
+  - "security monitor"
+  - "safety classifier"

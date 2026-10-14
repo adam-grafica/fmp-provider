@@ -81,3 +81,25 @@ test("config validation: bad heartbeat / bad route timeout refused", () => {
   assert.ok(CFG_LIB.validateConfig(CFG_LIB.loadConfig({ FMP_TIMEOUT_OPENAI_MS: "0" })).errors.length > 0);
   assert.deepEqual(CFG_LIB.parseHarnessLimits("opencode:100,bad,codex:abc"), { opencode: 100 });
 });
+
+test("safety classifier sub-request rerouted to fast classifier model", async () => {
+  const p = 23299;
+  const fxP = 23399;
+  const fx = await H.spawnFixture(fxP, "ok");
+  const fmp = await H.spawnFmp(p, {
+    FMP_UPSTREAM: `http://127.0.0.1:${fxP}/`,
+    FMP_CLASSIFIER_MODEL: "claude-fable-5",
+  });
+  try {
+    const { status, body } = await H.post(p, "/v1/messages", {
+      model: "claude-opus-5.5",
+      system: "You are a security monitor for autonomous AI coding agents.",
+      messages: [{ role: "user", content: "Check this command" }],
+    }, null, { "x-harness": "claude-code", "x-fmp-meta": "1" });
+    assert.equal(status, 200);
+    assert.equal(body._meta.alias, "claude-fable-5");
+  } finally {
+    await H.kill(fmp);
+    await H.kill(fx);
+  }
+});

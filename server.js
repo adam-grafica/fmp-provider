@@ -1496,11 +1496,21 @@ async function handleMessages(req, res, body, requestId) {
     stats.errors++;
     return anthropicError(res, 400, "model is required: request must explicitly select an alias (no ambient fallback)", req);
   }
-  const model = stripPrefix(body.model);
+  let model = stripPrefix(body.model);
   if (!MODELS_LIB.isKnown(model)) {
     release();
     stats.errors++;
     return anthropicError(res, 404, `model '${body.model}' not found. Valid: ${[...MODEL_IDS].join(", ")}`, req);
+  }
+  // Safety Classifier fast-routing (FMP_CLASSIFIER_MODEL):
+  // When Claude Code auto-mode sends a security monitor / safety classifier sub-prompt,
+  // reroute to a low-latency model (e.g. claude-fable-5) to avoid classifier timeouts.
+  const sysTextForClassifier = textOfContent(body.system).toLowerCase();
+  const isClassifierReq = (harness === "claude-code" || req.headers["x-harness"] === "claude-code") &&
+    CFG.classifierMatch.some((needle) => sysTextForClassifier.includes(needle));
+  if (isClassifierReq && CFG.classifierModel && MODELS_LIB.isKnown(CFG.classifierModel)) {
+    trace(`ANT/classifier reroute ${model} -> ${CFG.classifierModel} (fast classifier slot)`);
+    model = CFG.classifierModel;
   }
   if (KILL_ALL || DISABLED_MODELS.has(model)) {
     release();
