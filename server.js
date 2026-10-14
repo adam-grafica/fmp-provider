@@ -1548,7 +1548,8 @@ async function handleMessages(req, res, body, requestId) {
 
   const t0 = Date.now();
   trace(`${logTag} START-LIVE stream=${stream} tools=${antDefs.length} thinking=${thinking}`);
-  const fullMode = body.stream_mode === "full";
+    const hasTools = antDefs.length && !antDisabled;
+  const fullMode = body.stream_mode === "full" || (hasTools && stream);
   if (fullMode && stream) {
     let got;
     try {
@@ -1570,21 +1571,44 @@ async function handleMessages(req, res, body, requestId) {
     const capped = applyMaxTokens(got, maxTokens);
     if (capped.hit) trace(`${logTag} MAXTOKENS cut=${got.length}->${capped.text.length}`);
     const ftext = capped.hit ? capped.text : got;
-    const fstop = capped.hit ? "max_tokens" : "end_turn";
     usage[tier].tokens += estTokens(ftext);
+
+    const tc0 = hasTools ? await resolveToolCall(ftext, antDefs, wmAnt, model, logTag) : null;
     res.writeHead(200, sseHeaders(req));
     const fsend = (obj) => res.write("event: " + obj._ev + "\ndata: " + JSON.stringify(obj._d) + "\n\n");
     const fev = (name, d) => ({ _ev: name, _d: d });
     fsend(fev("message_start", { type: "message_start", message: { id: msgId, type: "message", role: "assistant", model, content: [], stop_reason: null, stop_sequence: null, usage: { input_tokens: inputTokens, output_tokens: 1 } } }));
-    fsend(fev("content_block_start", { type: "content_block_start", index: 0, content_block: { type: "text", text: "" } }));
-    const CH = 48;
-    for (let i = 0; i < ftext.length; i += CH) {
-      fsend(fev("content_block_delta", { type: "content_block_delta", index: 0, delta: { type: "text_delta", text: ftext.slice(i, i + CH) } }));
+
+    if (tc0) {
+      let blockIdx = 0;
+      if (tc0.prefixText) {
+        fsend(fev("content_block_start", { type: "content_block_start", index: blockIdx, content_block: { type: "text", text: "" } }));
+        const CH = 48;
+        for (let i = 0; i < tc0.prefixText.length; i += CH) {
+          fsend(fev("content_block_delta", { type: "content_block_delta", index: blockIdx, delta: { type: "text_delta", text: tc0.prefixText.slice(i, i + CH) } }));
+        }
+        fsend(fev("content_block_stop", { type: "content_block_stop", index: blockIdx }));
+        blockIdx++;
+      }
+      const tuId = "toolu_" + rid().slice(0, 20);
+      fsend(fev("content_block_start", { type: "content_block_start", index: blockIdx, content_block: { type: "tool_use", id: tuId, name: tc0.name, input: {} } }));
+      fsend(fev("content_block_delta", { type: "content_block_delta", index: blockIdx, delta: { type: "input_json_delta", partial_json: tc0.args } }));
+      fsend(fev("content_block_stop", { type: "content_block_stop", index: blockIdx }));
+      fsend(fev("message_delta", { type: "message_delta", delta: { stop_reason: "tool_use", stop_sequence: null }, usage: { output_tokens: estTokens(ftext) } }));
+      fsend(fev("message_stop", { type: "message_stop" }));
+      trace(`${logTag} SERVED-TOOL-STREAM name=${tc0.name} elapsed=${Date.now() - t0}ms`);
+    } else {
+      const fstop = capped.hit ? "max_tokens" : "end_turn";
+      fsend(fev("content_block_start", { type: "content_block_start", index: 0, content_block: { type: "text", text: "" } }));
+      const CH = 48;
+      for (let i = 0; i < ftext.length; i += CH) {
+        fsend(fev("content_block_delta", { type: "content_block_delta", index: 0, delta: { type: "text_delta", text: ftext.slice(i, i + CH) } }));
+      }
+      fsend(fev("content_block_stop", { type: "content_block_stop", index: 0 }));
+      fsend(fev("message_delta", { type: "message_delta", delta: { stop_reason: fstop, stop_sequence: null }, usage: { output_tokens: estTokens(ftext) } }));
+      fsend(fev("message_stop", { type: "message_stop" }));
+      trace(`${logTag} SERVED-FULL chars=${ftext.length} stop=${fstop} elapsed=${Date.now() - t0}ms`);
     }
-    fsend(fev("content_block_stop", { type: "content_block_stop", index: 0 }));
-    fsend(fev("message_delta", { type: "message_delta", delta: { stop_reason: fstop, stop_sequence: null }, usage: { output_tokens: estTokens(ftext) } }));
-    fsend(fev("message_stop", { type: "message_stop" }));
-    trace(`${logTag} SERVED-FULL chars=${ftext.length} stop=${fstop} elapsed=${Date.now() - t0}ms`);
     release();
     return res.end();
   }
