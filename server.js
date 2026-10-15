@@ -359,7 +359,9 @@ function toWorkerMessagesOA(messages) {
     if (role === "assistant" && Array.isArray(m.tool_calls) && m.tool_calls.length) {
       for (const tc of m.tool_calls) {
         const fn = (tc && tc.function) || {};
-        text += `\n[llamada a herramienta ${fn.name || (tc && tc.id) || ""}] ${fn.arguments || ""}`.trimEnd();
+        const toolName = fn.name || (tc && tc.id) || "";
+        const argsStr = fn.arguments || "{}";
+        text += `\nEXEC:::${toolName} ARGS ${argsStr}`.trimEnd();
       }
       text = text.trim();
     }
@@ -402,7 +404,9 @@ function toWorkerMessagesAnt(system, messages) {
     // tool_use nativo Anthropic -> texto para el worker.
     if (role === "assistant" && Array.isArray(m.content)) {
       const uses = m.content.filter((p) => p && p.type === "tool_use");
-      for (const u of uses) text += `\n[llamada a herramienta ${u.name || ""}] ${JSON.stringify(u.input || {})}`;
+      for (const u of uses) {
+        text += `\nEXEC:::${u.name || ""} ARGS ${JSON.stringify(u.input || {})}`;
+      }
       text = text.trim();
     }
     raw.push({ role, content: text });
@@ -1109,7 +1113,7 @@ function toWorkerMessagesResp(input) {
       if (!m || typeof m !== "object") continue;
       // function_call: el asistente pidió ejecutar una tool.
       if (m.type === "function_call") {
-        out.push({ role: "assistant", content: `[llamada a herramienta ${m.name || "tool"}] ${m.arguments || m.call_id || ""}`.trim() });
+        out.push({ role: "assistant", content: `EXEC:::${m.name || "tool"} ARGS ${m.arguments || "{}"}`.trim() });
         continue;
       }
       // function_call_output: resultado de la ejecución (Codex lo ejecuta local).
