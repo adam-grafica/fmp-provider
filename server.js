@@ -749,9 +749,10 @@ async function handleChatCompletions(req, res, body, requestId) {
   // con finish length (igual que API nativa). Default 4096.
   // Per-harness cap (HARDENING-001): min(global ceil, FMP_HARNESS_LIMITS[harness]).
   const maxTokens = Math.min(effMaxTokens(body.max_tokens ?? body.max_completion_tokens, 4096), HARNESS_CAP);
+  const hasTools = oaiDefs.length && body.tool_choice !== "none";
   // stream_mode full: bufferiza íntegro y luego emite SSE (para rachas
-  // malas de upstream). Default live, como API nativa.
-  const fullMode = body.stream_mode === "full";
+  // malas de upstream o cuando hay tools activas para resolución limpia).
+  const fullMode = body.stream_mode === "full" || (hasTools && stream);
 
   const id = "chatcmpl-" + rid();
   const created = Math.floor(Date.now() / 1000);
@@ -858,16 +859,32 @@ async function handleChatCompletions(req, res, body, requestId) {
     const ftext = capped.text;
     const ffinish = capped.hit ? "length" : got.finish;
     usage[tier].tokens += estTokens(ftext);
+
+    const tc0 = hasTools ? await resolveToolCall(ftext, oaiDefs, wm, model, logTag) : null;
     res.writeHead(200, sseHeaders(req));
     const fsend = (obj) => res.write("data: " + JSON.stringify(obj) + "\n\n");
     fsend({ id, object: "chat.completion.chunk", created, model, choices: [{ index: 0, delta: { role: "assistant" }, finish_reason: null }] });
-    const CH = 48;
-    for (let i = 0; i < ftext.length; i += CH) {
-      fsend({ id, object: "chat.completion.chunk", created, model, choices: [{ index: 0, delta: { content: ftext.slice(i, i + CH) }, finish_reason: null }] });
+
+    if (tc0) {
+      if (tc0.prefixText) {
+        const CH = 48;
+        for (let i = 0; i < tc0.prefixText.length; i += CH) {
+          fsend({ id, object: "chat.completion.chunk", created, model, choices: [{ index: 0, delta: { content: tc0.prefixText.slice(i, i + CH) }, finish_reason: null }] });
+        }
+      }
+      const tcId = "call_" + rid().slice(0, 20);
+      fsend({ id, object: "chat.completion.chunk", created, model, choices: [{ index: 0, delta: { tool_calls: [{ index: 0, id: tcId, type: "function", function: { name: tc0.name, arguments: tc0.args } }] }, finish_reason: null }] });
+      fsend({ id, object: "chat.completion.chunk", created, model, choices: [{ index: 0, delta: {}, finish_reason: "tool_calls" }] });
+      trace(`${logTag} SERVED-TOOL-STREAM-OAI name=${tc0.name} elapsed=${Date.now() - t0}ms`);
+    } else {
+      const CH = 48;
+      for (let i = 0; i < ftext.length; i += CH) {
+        fsend({ id, object: "chat.completion.chunk", created, model, choices: [{ index: 0, delta: { content: ftext.slice(i, i + CH) }, finish_reason: null }] });
+      }
+      fsend({ id, object: "chat.completion.chunk", created, model, choices: [{ index: 0, delta: {}, finish_reason: ffinish }] });
+      trace(`${logTag} SERVED-FULL chars=${ftext.length} finish=${ffinish} elapsed=${Date.now() - t0}ms`);
     }
-    fsend({ id, object: "chat.completion.chunk", created, model, choices: [{ index: 0, delta: {}, finish_reason: ffinish }] });
     res.write("data: [DONE]\n\n");
-    trace(`${logTag} SERVED-FULL chars=${ftext.length} finish=${ffinish} elapsed=${Date.now() - t0}ms`);
     release();
     return res.end();
   }
@@ -1198,20 +1215,16 @@ function agentSystemPrompt(tools) {
   if (!defs.length) return "";
   const lines = defs.map((d) => `- ${d.name}: ${d.description} params=${JSON.stringify(d.params).slice(0, 800)}`);
   return [
-    // Protocolo nativo de herramientas para el harness cliente (Claude Code / Codex / OpenCode).
+    // Protocolo nativo de herramientas para el harness cliente (Claude Code, Hermes, OpenCode, Codex).
     "INSTRUCCIONES CRÍTICAS PARA HERRAMIENTAS:",
-    "Tienes herramientas reales disponibles a través del entorno. Si necesitas leer archivos, explorar carpetas o ejecutar comandos, debes invocar la herramienta correspondiente.",
-    "REGLA DE ORO: Cuando decidas invocar una herramienta, responde ÚNICAMENTE con el bloque de ejecución, SIN explicaciones previas, SIN preámbulos conversacionales, y SIN pedir disculpas.",
+    "Tienes herramientas reales conectadas al entorno para interactuar con el sistema operativo, archivos y procesos.",
+    "ACCESO AL SISTEMA Y ARCHIVOS: Tienes acceso total. Si el usuario te pide leer, inspeccionar o buscar archivos (ej: código, scripts, configs en el workspace o carpetas del sistema), o ejecutar comandos del sistema, DEBES usar la herramienta correspondiente de tu catálogo. NUNCA digas que no tienes acceso, NUNCA pidas que te peguen el contenido, y NUNCA generes scripts de prueba ficticios o simulaciones cuando se te pide una acción real.",
+    "REGLA DE ORO: Cuando decidas invocar una herramienta, responde ÚNICAMENTE con el bloque de ejecución en su propia línea, SIN explicaciones previas, SIN preámbulos conversacionales, y SIN pedir disculpas.",
     "Formato de llamada exacto (en una sola línea):",
-    "EXEC:::<nombre_herramienta> ARGS <json con los parámetros>",
-    "Directrices por herramienta:",
-    "- ACCESO A ARCHIVOS LOCALES: Tienes acceso total al espacio de trabajo local del proyecto. Si el usuario te pide revisar o trabajar con un archivo existente (por ejemplo 'icon-blue-d.svg', código, scripts o configuración), USA INMEDIATAMENTE View o Read con {\"file_path\": \"<ruta>\"} o GlobTool para encontrarlo. NUNCA digas que no tienes acceso a archivos externos ni le pidas al usuario que pegue el contenido.",
-    "- Para leer o inspeccionar archivos: USA View o Read (pasando la ruta en JSON).",
-    "- Para listar directorios o buscar archivos: USA GlobTool, LS o Read.",
-    "- Para ejecutar comandos shell en el sistema (npm, git, scripts): USA Bash con {\"command\": \"comando\"}. El comando debe ser solo código shell ejecutable, NUNCA texto conversacional ni JSON embebido.",
-    "Herramientas disponibles:",
+    "EXEC:::<nombre_herramienta> ARGS <json con los parámetros exactos requeridos por la herramienta>",
+    "Herramientas disponibles en este entorno:",
     ...lines,
-    "Si la consulta no requiere herramientas (por ejemplo dar explicaciones teóricas, conceptos o plantillas de código), responde normalmente en texto plano o markdown SIN bloques EXEC.",
+    "Si la consulta no requiere herramientas (por ejemplo dar explicaciones teóricas, conceptos o responder preguntas generales), responde normalmente en texto plano o markdown SIN bloques EXEC.",
   ].join("\n");
 }
 

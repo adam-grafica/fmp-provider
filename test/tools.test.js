@@ -144,3 +144,29 @@ test("unit: nested system array is flattened without dropping text", async () =>
     await H.kill(fx3);
   }
 });
+
+test("unit: OpenAI streaming with tools emits clean tool_calls via buffered stream", async () => {
+  const fxP4 = 23334;
+  const p4 = 23234;
+  const fx4 = await H.spawnFixture(fxP4, "exec");
+  const fmp4 = await H.spawnFmp(p4, { FMP_UPSTREAM: `http://127.0.0.1:${fxP4}/` });
+  try {
+    const r = await fetch(`http://127.0.0.1:${p4}/v1/chat/completions`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        model: "sol",
+        stream: true,
+        messages: [{ role: "user", content: "use calc" }],
+        tools: [{ type: "function", function: { name: "calc", description: "d", parameters: { type: "object" } } }],
+      }),
+    });
+    assert.equal(r.status, 200);
+    const text = await r.text();
+    assert.ok(text.includes('"tool_calls"'), "SSE stream must contain tool_calls delta");
+    assert.ok(text.includes('"finish_reason":"tool_calls"'), "SSE stream finish_reason must be tool_calls");
+  } finally {
+    await H.kill(fmp4);
+    await H.kill(fx4);
+  }
+});
