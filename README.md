@@ -1,4 +1,4 @@
-# FMP — Private Development Inference Adapter (v2.2.0)
+# FMP — Private Development Inference Adapter (v2.3.1)
 
 FMP is a private experimental inference adapter.
 Upstream model labels are declared by upstream and not independently
@@ -15,7 +15,7 @@ dependencies (Node 18+ only).
 ## Status
 
 ```text
-FMP v2.2.0 — PRIVATE DEVELOPMENT READY
+FMP v2.3.1 — PRIVATE DEVELOPMENT READY
 Linux: LOCALHOST / 9Router READY
 Windows: LOCAL INSTALLATION READY
 Production: NOT AUTHORIZED — public exposure NOT AUTHORIZED,
@@ -42,6 +42,32 @@ node bin/fmp.js health && node bin/fmp.js models
 | POST | `/v1/chat/completions` | key* | OpenAI, stream + `stream_mode: full` |
 | POST | `/v1/messages` | key* | Anthropic, stream + `stream_mode: full` |
 | POST | `/v1/responses` | key* | DISABLED by default (experimental) |
+
+### 9Router Model Suites & Prefixes
+
+FMP upstream models are exposed cleanly through 9Router with explicit route differentiation:
+
+- **OpenAI Compatible Suite (`fmp-oai/*`)**:
+  - `fmp-oai/sol` (Default agentic assistant, high speed)
+  - `fmp-oai/terra` (Agentic assistant, high speed)
+  - `fmp-oai/claude-opus-5.5`
+  - `fmp-oai/claude-sonnet-5`
+  - `fmp-oai/claude-fable-5`
+  - `fmp-oai/claude-fable-5.1`
+  - `fmp-oai/glm-5.2`
+  - `fmp-oai/kimi-k3`
+  *(Routes to `/v1/chat/completions` with native streaming tool_calls buffer)*
+
+- **Anthropic Native Suite (`fmp-ant/*`)**:
+  - `fmp-ant/claude-opus-5.5` (Flagship Anthropic model)
+  - `fmp-ant/claude-sonnet-5`
+  - `fmp-ant/claude-fable-5`
+  - `fmp-ant/claude-fable-5.1`
+  - `fmp-ant/sol`
+  - `fmp-ant/terra`
+  - `fmp-ant/glm-5.2`
+  - `fmp-ant/kimi-k3`
+  *(Routes to `/v1/messages` with content block tool_use streaming)*
 
 \* key = required only when `FMP_API_KEYS` is configured; health stays public.
 
@@ -92,11 +118,11 @@ node bin/fmp.js config validate   # validate only
 npm test   # node --test, fixtures only, no network/secrets
 ```
 
-31 tests: chat/stream both routes, retry, JSON fallback, auth gate,
+42 tests: chat/stream both routes, retry, JSON fallback, auth gate,
 rate limit, kill switch, tool transport both routes, malformed
 schemas, redaction, graceful shutdown, config validation, catalog.
 
 ## Versioning
 
-`CHANGELOG.md` tracks releases. Current: v2.2.0 private development
+`CHANGELOG.md` tracks releases. Current: v2.3.1 private development
 ready. No release published by this task; no production routing.

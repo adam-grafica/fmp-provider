@@ -1,5 +1,25 @@
 # FMP Changelog
 
+## v2.3.1 — PRODUCTION AGENTIC TOOL HARDENING & 9ROUTER REFINEMENT (2026-10-15)
+
+Production readiness hardening for agentic tool calls across OpenAI and Anthropic routes,
+Windows and Linux parity, and clean 9Router catalog routing:
+
+- **OpenAI Streaming Tool Resolution**: When client requests tool calls with `stream: true`,
+  upstream generation is buffered into a complete turn and re-emitted as standard SSE chunks
+  (`delta.tool_calls`, `finish_reason: "tool_calls"`) followed by `data: [DONE]`.
+- **Agnostic Tool Bridging**: Replaced heuristic keyword triggers with a dynamic, agnostic
+  system prompt adapter that exposes the client harness's actual tool schemas (`read_file`,
+  `terminal`, `View`, `Bash`, etc.) without hardcoding names or generating apologies.
+- **Markdown Code Block Protection**: Prevented normal markdown code blocks (```bash`) from
+  being falsely hijacked into premature `Bash` tool calls.
+- **Anthropic Nested System Flattening**: Added recursive `flattenSystem` handling complex
+  nested text arrays in Anthropic requests.
+- **9Router Catalog Unification**: Standardized clean separation between `fmp-oai/*` (OpenAI
+  chat completions) and `fmp-ant/*` (Anthropic messages native), removing redundant legacy prefixes.
+- **Automated Verification**: Test suite expanded to 42 tests, verifying streaming tool
+  calls, nested system prompts, markdown preservation, and multi-tool schemas.
+
 ## v2.2.0 — PRIVATE DEVELOPMENT READY (2026-10-10, unreleased)
 
 Security + contracts professionalization. No release published; branch
