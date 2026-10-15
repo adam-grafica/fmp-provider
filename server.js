@@ -1255,6 +1255,7 @@ function platformInstruction(platform) {
       "Tu herramienta de ejecución (terminal, Bash o similar) ejecuta directamente en el entorno Linux.",
       "- Rutas: Usa rutas estándar POSIX (ej: /home/... o /tmp/...).",
       "- Comandos: Emplea utilidades estándar de Linux (cat, sed, grep, ls, python3, curl, etc.).",
+      "- Scripts de Python en terminal: Usa siempre módulos estándar del sistema (os, sys, subprocess, requests, urllib, json, etc.). NUNCA intentes importar módulos virtuales o ficticios como 'hermes_tools' dentro de la terminal; 'terminal' corre directamente en el Linux real.",
     ].join("\n");
   }
   return [
@@ -1276,7 +1277,7 @@ function agentSystemPrompt(tools, modelId, transport, platform) {
     return [
       "INSTRUCCIONES PARA EL USO DE HERRAMIENTAS:",
       "Tienes acceso real y directo a herramientas del sistema para interactuar con el entorno, archivos y procesos.",
-      "PROCEDENCIA Y ENTORNO REAL: Estás conectado directamente al entorno y sistema operativo real del usuario. Tienes acceso completo a la red, procesos y sistema de archivos a través de tus herramientas autorizadas. NUNCA asumas que estás en un sandbox aislado sin internet, NUNCA inventes limitaciones que no existen, y NUNCA pidas que te peguen archivos manualmente cuando tienes herramientas para consultarlos o crearlos.",
+      "PROCEDENCIA Y ENTORNO REAL: Estás conectado directamente al entorno y sistema operativo real del usuario. Tienes acceso completo a la red, procesos y sistema de archivos a través de tus herramientas autorizadas. NUNCA asumas que estás en un sandbox aislado sin internet ni simules limitaciones que no existen. Ejecuta directamente los comandos requeridos sin pedir que el usuario lo haga por ti.",
       "HERRAMIENTAS VÁLIDAS: ÚNICAMENTE puedes invocar las herramientas que figuran en el catálogo de herramientas disponibles. No inventes nombres inexistentes.",
       platText,
       "FORMATO DE LLAMADA: Para invocar una herramienta, responde usando el formato de etiquetas XML estándar:",
