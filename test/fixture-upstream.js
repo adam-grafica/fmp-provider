@@ -31,6 +31,7 @@ const server = http.createServer((req, res) => {
     if (!stream) {
       res.writeHead(200, { "content-type": "application/json" });
       if (MODE === "exec") return res.end(JSON.stringify({ content: "claro\nEXEC:::calc ARGS {\"a\":1}" }));
+      if (MODE === "markdown_block") return res.end(JSON.stringify({ content: "Aqui tienes las instrucciones:\n```bash\n**Instrucciones: no command\n```\nlisto." }));
       if (MODE === "always-truncate") return res.end(JSON.stringify({ content: "fixture json fallback reply" }));
       return res.end(JSON.stringify({ content: "fixture json reply" }));
     }
@@ -48,6 +49,11 @@ const server = http.createServer((req, res) => {
     }
     if (MODE === "exec") {
       sseChunk(res, "claro\nEXEC:::calc ARGS {\"a\":1}");
+      res.write("data: [DONE]\n\n");
+      return res.end();
+    }
+    if (MODE === "markdown_block") {
+      sseChunk(res, "Aqui tienes las instrucciones:\n```bash\n**Instrucciones: no command\n```\nlisto.");
       res.write("data: [DONE]\n\n");
       return res.end();
     }

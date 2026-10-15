@@ -101,3 +101,46 @@ test("unit: multiline JSON in EXEC block parsed cleanly", () => {
   assert.deepEqual(hit.args, { path: "package.json" });
   assert.equal(hit.prefixText, "claro");
 });
+
+test("unit: markdown code block without EXEC is not hijacked into Bash tool call", async () => {
+  const fxP2 = 23332;
+  const p2 = 23232;
+  const fx2 = await H.spawnFixture(fxP2, "markdown_block");
+  const fmp2 = await H.spawnFmp(p2, { FMP_UPSTREAM: `http://127.0.0.1:${fxP2}/` });
+  try {
+    const { status, body } = await H.post(p2, "/v1/messages", {
+      model: "sol",
+      max_tokens: 100,
+      messages: [{ role: "user", content: "hi" }],
+      tools: [{ name: "Bash", input_schema: { type: "object" } }],
+    });
+    assert.equal(status, 200);
+    // When the worker emits markdown without EXEC:::, it must remain normal text, not tool_use
+    const hasToolUse = body.content.some((b) => b.type === "tool_use");
+    assert.equal(hasToolUse, false, "markdown code block must not be transformed into Bash tool_use");
+  } finally {
+    await H.kill(fmp2);
+    await H.kill(fx2);
+  }
+});
+
+test("unit: nested system array is flattened without dropping text", async () => {
+  const fxP3 = 23333;
+  const p3 = 23233;
+  const fx3 = await H.spawnFixture(fxP3, "ok");
+  const fmp3 = await H.spawnFmp(p3, { FMP_UPSTREAM: `http://127.0.0.1:${fxP3}/` });
+  try {
+    const { status, body } = await H.post(p3, "/v1/messages", {
+      model: "sol",
+      system: [
+        { type: "text", text: "System prompt part 1" },
+        { type: "text", text: "System prompt part 2" },
+      ],
+      messages: [{ role: "user", content: "test nested system" }],
+    });
+    assert.equal(status, 200);
+  } finally {
+    await H.kill(fmp3);
+    await H.kill(fx3);
+  }
+});

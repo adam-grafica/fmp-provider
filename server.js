@@ -282,22 +282,43 @@ function textOfContent(content) {
   if (Array.isArray(content)) {
     return content.map((p) => {
       if (typeof p === "string") return p;
+      if (Array.isArray(p)) return textOfContent(p);
       if (p && typeof p === "object") {
         if (typeof p.text === "string") return p.text;
         if (p.type === "image_url" || p.type === "image") return "";
         if (p.type === "tool_result") {
           const raw = p.content !== undefined ? p.content : p.output;
-          if (typeof raw === "string") return raw;
-          if (Array.isArray(raw)) return textOfContent(raw);
-          return JSON.stringify(raw ?? "");
+          return textOfContent(raw);
         }
         if (p.type === "tool_use") return "";
         return "";
       }
       return "";
-    }).join("");
+    }).filter(Boolean).join("\n");
   }
   return String(content);
+}
+
+function flattenSystem(sys) {
+  if (!sys) return [];
+  if (typeof sys === "string") return sys.trim() ? [sys.trim()] : [];
+  if (Array.isArray(sys)) {
+    const parts = [];
+    for (const item of sys) {
+      if (!item) continue;
+      if (typeof item === "string" && item.trim()) parts.push(item.trim());
+      else if (Array.isArray(item)) parts.push(...flattenSystem(item));
+      else if (typeof item === "object") {
+        if (typeof item.text === "string" && item.text.trim()) parts.push(item.text.trim());
+        else if (item.content !== undefined) parts.push(...flattenSystem(item.content));
+      }
+    }
+    return parts;
+  }
+  if (typeof sys === "object" && typeof sys.text === "string" && sys.text.trim()) {
+    return [sys.text.trim()];
+  }
+  return [];
 }
 
 // Inyecta instrucciones del sistema/tools como prefijo del primer user message
@@ -349,12 +370,7 @@ function toWorkerMessagesOA(messages) {
 
 function toWorkerMessagesAnt(system, messages) {
   const raw = [];
-  const systemParts = [];
-  if (typeof system === "string" && system.trim()) systemParts.push(system.trim());
-  else if (Array.isArray(system)) {
-    const t = textOfContent(system).trim();
-    if (t) systemParts.push(t);
-  }
+  const systemParts = flattenSystem(system);
   for (const m of messages || []) {
     if (!m || typeof m !== "object") continue;
     if (m.role === "system") {
@@ -1024,10 +1040,10 @@ async function handleChatCompletions(req, res, body, requestId) {
     let tcLive = oaiDefs.length ? parseToolCall(emitted, oaiDefs) : null;
     if (!tcLive && oaiDefs.length) {
       const shellCmd = extractShellBlock(emitted);
-      const execTool = (oaiDefs || []).find((t) => t.name === "exec_command" || t.name === "Bash");
+      const execTool = (oaiDefs || []).find((t) => t.name === "exec_command");
       if (shellCmd && execTool) {
         const toolName = execTool.name;
-        const args = toolName === "Bash" ? { command: shellCmd } : { cmd: shellCmd };
+        const args = { cmd: shellCmd };
         tcLive = { name: toolName, args: JSON.stringify(args) };
       }
     }
@@ -1123,9 +1139,12 @@ function parseToolCall(text, availTools) {
 // Fallback agéntico: si el worker no emitió EXEC::: pero el texto trae
 // un bloque shell (```bash ... ```), convertir el primero a exec_command.
 // Codex pide aprobación al usuario antes de ejecutar, no hay ejecución ciega.
+// Fallback agéntico estricto (solo para herramientas tipo exec_command en flujos legacy):
+// Si el worker emite un bloque explícito de shell (```bash ... ```), convertirlo.
+// NUNCA aplica a bloques sin lenguaje ni a la herramienta 'Bash' de Claude Code (que requiere EXEC:::).
 function extractShellBlock(text) {
   if (!text) return null;
-  const m = text.match(/```(?:bash|sh|shell|zsh|cmd|powershell|console|terminal)?\s*\n([\s\S]*?)```/);
+  const m = text.match(/```(?:bash|sh|shell|zsh)\s*\n([\s\S]*?)```/);
   if (!m) return null;
   const cmd = m[1].trim();
   if (!cmd || cmd.length > 2000 || cmd.includes("\n\n\n")) return null;
@@ -1141,11 +1160,11 @@ async function resolveToolCall(text, defs, wm, modelId, logTag) {
   let tc = parseToolCall(text, defs);
   if (tc) return tc;
   const shellCmd = extractShellBlock(text);
-  const execTool = (defs || []).find((t) => t.name === "exec_command" || t.name === "Bash");
+  const execTool = (defs || []).find((t) => t.name === "exec_command");
   if (shellCmd && execTool) {
     const i = text.indexOf("```");
     const toolName = execTool.name;
-    const args = toolName === "Bash" ? { command: shellCmd } : { cmd: shellCmd };
+    const args = { cmd: shellCmd };
     // Solo el NOMBRE de la tool en logs — nunca el comando (Phase 3).
     trace(`${logTag} SHELL-BLOCK-TRANSPORT name=${toolName} (transport only, not executed)`);
     return { name: toolName, args: JSON.stringify(args), prefixText: text.slice(0, i).trim() };
@@ -1186,12 +1205,13 @@ function agentSystemPrompt(tools) {
     "Formato de llamada exacto (en una sola línea):",
     "EXEC:::<nombre_herramienta> ARGS <json con los parámetros>",
     "Directrices por herramienta:",
+    "- ACCESO A ARCHIVOS LOCALES: Tienes acceso total al espacio de trabajo local del proyecto. Si el usuario te pide revisar o trabajar con un archivo existente (por ejemplo 'icon-blue-d.svg', código, scripts o configuración), USA INMEDIATAMENTE View o Read con {\"file_path\": \"<ruta>\"} o GlobTool para encontrarlo. NUNCA digas que no tienes acceso a archivos externos ni le pidas al usuario que pegue el contenido.",
     "- Para leer o inspeccionar archivos: USA View o Read (pasando la ruta en JSON).",
     "- Para listar directorios o buscar archivos: USA GlobTool, LS o Read.",
     "- Para ejecutar comandos shell en el sistema (npm, git, scripts): USA Bash con {\"command\": \"comando\"}. El comando debe ser solo código shell ejecutable, NUNCA texto conversacional ni JSON embebido.",
     "Herramientas disponibles:",
     ...lines,
-    "Si la consulta no requiere herramientas, responde normalmente en texto plano sin bloques EXEC.",
+    "Si la consulta no requiere herramientas (por ejemplo dar explicaciones teóricas, conceptos o plantillas de código), responde normalmente en texto plano o markdown SIN bloques EXEC.",
   ].join("\n");
 }
 
@@ -1845,17 +1865,8 @@ async function handleMessages(req, res, body, requestId) {
     // Sin rescate por continuación (ver nota OAI): cierre honesto.
     // Cap de max_tokens -> max_tokens (como API nativa).
     let antFinal = cappedHit ? "max_tokens" : (complete ? "end_turn" : "max_tokens");
-    // Puente tool-use post-stream (solo EXEC explícito: el texto ya salió).
+    // Puente tool-use post-stream: solo si el worker emitió EXEC explícito.
     let tcLive = antDefs.length && !antDisabled ? parseToolCall(emitted, antDefs) : null;
-    if (!tcLive && antDefs.length && !antDisabled) {
-      const shellCmd = extractShellBlock(emitted);
-      const execTool = (antDefs || []).find((t) => t.name === "exec_command" || t.name === "Bash");
-      if (shellCmd && execTool) {
-        const toolName = execTool.name;
-        const args = toolName === "Bash" ? { command: shellCmd } : { cmd: shellCmd };
-        tcLive = { name: toolName, args: JSON.stringify(args) };
-      }
-    }
     if (tcLive) {
       let input = {};
       try { input = JSON.parse(tcLive.args); } catch { input = {}; }
