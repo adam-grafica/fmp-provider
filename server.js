@@ -361,7 +361,7 @@ function toWorkerMessagesOA(messages) {
         const fn = (tc && tc.function) || {};
         const toolName = fn.name || (tc && tc.id) || "";
         const argsStr = fn.arguments || "{}";
-        text += `\nEXEC:::${toolName} ARGS ${argsStr}`.trimEnd();
+        text += `\n<tool_call>\n{"name": "${toolName}", "arguments": ${argsStr}}\n</tool_call>`.trimEnd();
       }
       text = text.trim();
     }
@@ -401,11 +401,11 @@ function toWorkerMessagesAnt(system, messages) {
     }
     const role = m.role === "assistant" ? "assistant" : "user";
     let text = textOfContent(m.content);
-    // tool_use nativo Anthropic -> texto para el worker.
+    // tool_use nativo Anthropic -> texto para el worker en formato Anthropic XML nativo.
     if (role === "assistant" && Array.isArray(m.content)) {
       const uses = m.content.filter((p) => p && p.type === "tool_use");
       for (const u of uses) {
-        text += `\nEXEC:::${u.name || ""} ARGS ${JSON.stringify(u.input || {})}`;
+        text += `\n<tool_use>\n<name>${u.name || ""}</name>\n<arguments>\n${JSON.stringify(u.input || {}, null, 2)}\n</arguments>\n</tool_use>`;
       }
       text = text.trim();
     }
@@ -767,7 +767,7 @@ async function handleChatCompletions(req, res, body, requestId) {
   // tools, pedir EXEC::: al worker. FMP nunca ejecuta la herramienta;
   // el harness cliente ejecuta y devuelve el resultado.
   const oaiTools = Array.isArray(body.tools) ? body.tools : [];
-  const oaiToolSys = (oaiDefs.length && body.tool_choice !== "none") ? agentSystemPrompt(oaiTools) : "";
+  const oaiToolSys = (oaiDefs.length && body.tool_choice !== "none") ? agentSystemPrompt(oaiTools, model, "openai") : "";
   const oaiInputMsgs = oaiToolSys ? [{ role: "system", content: oaiToolSys }, ...(body.messages || [])] : (body.messages || []);
   const wm = toWorkerMessagesOA(oaiInputMsgs);
 
@@ -1152,7 +1152,7 @@ function toWorkerMessagesResp(input) {
 // Valida contra lib/tools.js (fuente única); args se devuelve como
 // string JSON validado para los emisores de esquema nativo.
 function parseToolCall(text, availTools) {
-  const hit = TOOLS_LIB.parseExecBlock(text, availTools);
+  const hit = (TOOLS_LIB.parsePolyglotToolCall || TOOLS_LIB.parseExecBlock)(text, availTools);
   if (!hit) return null;
   return { name: hit.name, args: JSON.stringify(hit.args), prefixText: hit.prefixText };
 }
@@ -1214,23 +1214,50 @@ async function resolveToolCall(text, defs, wm, modelId, logTag) {
 
 const toolDefsForWorker = TOOLS_LIB.toolDefsForWorker;
 
-function agentSystemPrompt(tools) {
+function agentSystemPrompt(tools, modelId, transport) {
   const defs = toolDefsForWorker(tools);
   if (!defs.length) return "";
+  const isAnthropic = transport === "anthropic" || (typeof modelId === "string" && /claude/i.test(modelId));
+
+  if (isAnthropic) {
+    const lines = defs.map((d) => `- <tool_description>\n<name>${d.name}</name>\n<description>${d.description}</description>\n<parameters>${JSON.stringify(d.params)}</parameters>\n</tool_description>`);
+    return [
+      "INSTRUCCIONES PARA EL USO DE HERRAMIENTAS:",
+      "Tienes acceso real y directo a herramientas del sistema para interactuar con el entorno, archivos y procesos.",
+      "ACCESO TOTAL: Si el usuario te pide inspeccionar, leer, crear, editar o buscar archivos, o ejecutar comandos en el sistema, DEBES invocar la herramienta correspondiente. NUNCA digas que no tienes acceso, NUNCA pidas que te peguen el contenido manualmente, y NUNCA generes simulaciones ni tutoriales ficticios.",
+      "HERRAMIENTAS VÁLIDAS: ÚNICAMENTE puedes invocar las herramientas que figuran en el catálogo de herramientas disponibles. No inventes nombres inexistentes.",
+      "OPERACIONES EN EL SISTEMA: Si tu herramienta disponible es \x27terminal\x27 (o \x27Bash\x27/\x27bash\x27) y necesitas leer o modificar archivos o inspeccionar el entorno, ejecuta comandos estándar de Linux (cat, sed, grep, ls, python3, etc.) a través de \x27terminal\x27.",
+      "FORMATO DE LLAMADA: Para invocar una herramienta, responde usando el formato de etiquetas XML estándar:",
+      "<tool_use>",
+      "<name>nombre_herramienta</name>",
+      "<arguments>",
+      "{\"parametro\": \"valor\"}",
+      "</arguments>",
+      "</tool_use>",
+      "(También se acepta: EXEC:::nombre_herramienta ARGS { ... })",
+      "NUNCA finjas haber completado una tarea sin haber ejecutado la herramienta real que la realiza.",
+      "Herramientas disponibles:",
+      ...lines,
+      "Si la consulta del usuario no requiere herramientas (preguntas conceptuales, explicaciones teóricas), responde normalmente en texto o markdown sin invocar herramientas.",
+    ].join("\n");
+  }
+
   const lines = defs.map((d) => `- ${d.name}: ${d.description} params=${JSON.stringify(d.params).slice(0, 800)}`);
   return [
-    "INSTRUCCIONES CRÍTICAS PARA HERRAMIENTAS:",
+    "INSTRUCCIONES PARA EL USO DE HERRAMIENTAS:",
     "Tienes herramientas reales conectadas al entorno para interactuar con el sistema operativo, archivos y procesos.",
     "ACCESO AL SISTEMA Y ARCHIVOS: Tienes acceso total. Si el usuario te pide leer, inspeccionar, editar o buscar archivos, configs, scripts o ejecutar comandos del sistema, DEBES usar la herramienta correspondiente de tu catálogo. NUNCA digas que no tienes acceso, NUNCA pidas que te peguen el contenido, y NUNCA generes tutoriales o simulaciones ficticias cuando se te pide una acción real.",
     "PROHIBIDO INVENTAR HERRAMIENTAS: ÚNICAMENTE puedes invocar las herramientas que figuran en la lista de \x27Herramientas disponibles en este entorno\x27. NUNCA inventes nombres como file_edit, file_write o similares si no están en tu lista.",
     "OPERACIONES DE ARCHIVOS Y CONFIGURACIÓN: Si tu herramienta disponible es \x27terminal\x27 (o \x27Bash\x27/\x27bash\x27) y necesitas leer, inspeccionar, crear o modificar archivos en el sistema, ejecuta directamente comandos estándar de Linux (como cat, sed, grep, python3, tee, echo, ls) a través de \x27terminal\x27.",
-    "REGLA DE ORO: Cuando decidas invocar una herramienta, responde ÚNICAMENTE con el bloque de ejecución en su propia línea, SIN explicaciones previas, SIN preámbulos conversacionales, SIN pedir disculpas, y NUNCA encierres el bloque EXEC::: dentro de bloques de código markdown (```bash o ```).",
-    "NUNCA finjas haber completado una tarea (\x27Acciones completadas\x27) sin haber ejecutado la herramienta real que la realiza.",
-    "Formato de llamada exacto:",
-    "EXEC:::<nombre_herramienta> ARGS <json con los parámetros exactos requeridos por la herramienta>",
+    "FORMATO DE LLAMADA: Cuando decidas invocar una herramienta, emite la llamada en formato <tool_call> o bloque JSON:",
+    "<tool_call>",
+    "{\"name\": \"nombre_herramienta\", \"arguments\": {\"parametro\": \"valor\"}}",
+    "</tool_call>",
+    "(También se acepta: EXEC:::nombre_herramienta ARGS { ... })",
+    "NUNCA finjas haber completado una tarea sin haber ejecutado la herramienta real que la realiza.",
     "Herramientas disponibles en este entorno:",
     ...lines,
-    "Si la consulta no requiere herramientas (ej: dar explicaciones teóricas, conceptos o responder preguntas generales), responde normalmente en texto plano o markdown SIN bloques EXEC.",
+    "Si la consulta no requiere herramientas (ej: explicaciones teóricas, conceptos o preguntas generales), responde normalmente en texto plano o markdown sin invocar herramientas.",
   ].join("\n");
 }
 
@@ -1381,7 +1408,7 @@ async function handleResponses(req, res, body, requestId) {
   // convertirlo a function_call nativo.
   const fnTools = Array.isArray(body.tools) ? body.tools.filter((t) => t && t.type === "function" && t.name) : [];
   if (fnTools.length && body.tool_choice !== "none") {
-    const sys = agentSystemPrompt(body.tools);
+    const sys = agentSystemPrompt(body.tools, body.model, "openai");
     if (sys) workerMessages = [{ role: "system", content: sys }, ...workerMessages];
   }
   let resolved;
@@ -1596,7 +1623,7 @@ async function handleMessages(req, res, body, requestId) {
   const antTools = Array.isArray(body.tools) ? body.tools : [];
   const antChoice = body.tool_choice;
   const antDisabled = antChoice && (antChoice.type === "none" || antChoice === "none");
-  const antToolSys = (antDefs.length && !antDisabled) ? agentSystemPrompt(antTools) : "";
+  const antToolSys = (antDefs.length && !antDisabled) ? agentSystemPrompt(antTools, model, "anthropic") : "";
   const combinedAntSys = [antToolSys, body.system].filter(Boolean);
   const wmAnt = toWorkerMessagesAnt(combinedAntSys, body.messages);
 

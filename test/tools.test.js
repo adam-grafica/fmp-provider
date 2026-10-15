@@ -170,3 +170,64 @@ test("unit: OpenAI streaming with tools emits clean tool_calls via buffered stre
     await H.kill(fx4);
   }
 });
+
+
+test("unit: polyglot tool parser handles Hermes ChatML format", () => {
+  const text = "Voy a calcular:\n<tool_call>\n{\"name\": \"calc\", \"arguments\": {\"expr\": \"2+2\"}}\n</tool_call>";
+  const hit = T.parsePolyglotToolCall(text, [{ name: "calc" }]);
+  assert.ok(hit, "should parse Hermes ChatML");
+  assert.equal(hit.name, "calc");
+  assert.deepEqual(hit.args, { expr: "2+2" });
+  assert.equal(hit.prefixText, "Voy a calcular:");
+});
+
+test("unit: polyglot tool parser handles Anthropic XML tool_use format", () => {
+  const text = "Voy a ejecutar:\n<tool_use>\n<name>terminal</name>\n<arguments>\n{\"command\": \"ls -la\"}\n</arguments>\n</tool_use>";
+  const hit = T.parsePolyglotToolCall(text, [{ name: "terminal" }]);
+  assert.ok(hit, "should parse Anthropic XML tool_use");
+  assert.equal(hit.name, "terminal");
+  assert.deepEqual(hit.args, { command: "ls -la" });
+  assert.equal(hit.prefixText, "Voy a ejecutar:");
+});
+
+test("unit: polyglot tool parser handles Anthropic attribute XML format", () => {
+  const text = "<tool_use name=\"terminal\">\n{\"command\": \"pwd\"}\n</tool_use>";
+  const hit = T.parsePolyglotToolCall(text, [{ name: "terminal" }]);
+  assert.ok(hit, "should parse Anthropic attribute XML");
+  assert.equal(hit.name, "terminal");
+  assert.deepEqual(hit.args, { command: "pwd" });
+  assert.equal(hit.prefixText, "");
+});
+
+test("unit: polyglot tool parser handles Anthropic invoke XML format", () => {
+  const text = "<invoke name=\"terminal\">\n<parameter name=\"command\">uname -a</parameter>\n</invoke>";
+  const hit = T.parsePolyglotToolCall(text, [{ name: "terminal" }]);
+  assert.ok(hit, "should parse Anthropic invoke XML");
+  assert.equal(hit.name, "terminal");
+  assert.deepEqual(hit.args, { command: "uname -a" });
+  assert.equal(hit.prefixText, "");
+});
+
+test("unit: polyglot tool parser handles fenced markdown JSON", () => {
+  const text = "Aqui tienes la operacion:\n```json\n{\n  \"name\": \"calc\",\n  \"arguments\": {\"val\": 42}\n}\n```";
+  const hit = T.parsePolyglotToolCall(text, [{ name: "calc" }]);
+  assert.ok(hit, "should parse fenced markdown JSON");
+  assert.equal(hit.name, "calc");
+  assert.deepEqual(hit.args, { val: 42 });
+  assert.equal(hit.prefixText, "Aqui tienes la operacion:");
+});
+
+test("unit: polyglot tool parser handles raw tool_call JSON", () => {
+  const text = "pensando...\n{\"tool_call\": {\"name\": \"terminal\", \"arguments\": {\"command\": \"whoami\"}}}";
+  const hit = T.parsePolyglotToolCall(text, [{ name: "terminal" }]);
+  assert.ok(hit, "should parse raw tool_call JSON");
+  assert.equal(hit.name, "terminal");
+  assert.deepEqual(hit.args, { command: "whoami" });
+  assert.equal(hit.prefixText, "pensando...");
+});
+
+test("unit: polyglot tool parser rejects hallucinated phantom tools", () => {
+  const text = "simulando:\n<tool_call>{\"name\": \"file_edit\", \"arguments\": {\"file\": \"a.txt\"}}\n</tool_call>";
+  const hit = T.parsePolyglotToolCall(text, [{ name: "terminal" }, { name: "calc" }]);
+  assert.equal(hit, null, "phantom tools must be rejected");
+});
