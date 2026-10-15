@@ -766,8 +766,9 @@ async function handleChatCompletions(req, res, body, requestId) {
   // Puente tool-use (TRANSPORTE, no ejecución): si el cliente declara
   // tools, pedir EXEC::: al worker. FMP nunca ejecuta la herramienta;
   // el harness cliente ejecuta y devuelve el resultado.
+  const platform = detectClientPlatform(req, body);
   const oaiTools = Array.isArray(body.tools) ? body.tools : [];
-  const oaiToolSys = (oaiDefs.length && body.tool_choice !== "none") ? agentSystemPrompt(oaiTools, model, "openai") : "";
+  const oaiToolSys = (oaiDefs.length && body.tool_choice !== "none") ? agentSystemPrompt(oaiTools, model, "openai", platform) : "";
   const oaiInputMsgs = oaiToolSys ? [{ role: "system", content: oaiToolSys }, ...(body.messages || [])] : (body.messages || []);
   const wm = toWorkerMessagesOA(oaiInputMsgs);
 
@@ -1214,19 +1215,70 @@ async function resolveToolCall(text, defs, wm, modelId, logTag) {
 
 const toolDefsForWorker = TOOLS_LIB.toolDefsForWorker;
 
-function agentSystemPrompt(tools, modelId, transport) {
+function detectClientPlatform(req, body) {
+  const ua = String((req && req.headers && req.headers["user-agent"]) || "").toLowerCase();
+  const explicit = String((req && req.headers && req.headers["x-client-platform"]) || "").toLowerCase();
+  if (explicit.includes("win")) return "windows";
+  if (explicit.includes("linux")) return "linux";
+  if (explicit.includes("darwin") || explicit.includes("mac")) return "darwin";
+
+  if (ua.includes("win32") || ua.includes("windows")) return "windows";
+  if (ua.includes("linux")) return "linux";
+
+  const sample = JSON.stringify({
+    system: body && body.system,
+    messages: (body && body.messages ? body.messages.slice(0, 5) : null),
+  }).toLowerCase();
+
+  if (sample.includes("c:\\") || sample.includes("c:/") || sample.includes("\\users\\") || sample.includes("/c/users") || sample.includes("platform: win32") || sample.includes("os: windows")) {
+    return "windows";
+  }
+  if (sample.includes("/home/") || sample.includes("/etc/") || sample.includes("platform: linux") || sample.includes("os: linux")) {
+    return "linux";
+  }
+  return "auto";
+}
+
+function platformInstruction(platform) {
+  if (platform === "windows") {
+    return [
+      "ENTORNO DE EJECUCIÓN (WINDOWS): La máquina donde operas es un sistema WINDOWS real del usuario.",
+      "Tu herramienta de ejecución (Bash, terminal o similar) ejecuta en el entorno Windows del usuario (a menudo mediante Git-Bash o PowerShell).",
+      "- Rutas: Usa rutas compatibles con el entorno Windows (ej: C:\\Users\\... o /c/Users/...).",
+      "- Comandos: Usa comandos válidos para Windows / Git-Bash (ej: python, powershell, curl, dir, type, git). Si necesitas invocar PowerShell desde bash, ejecuta: powershell.exe -NoProfile -Command \"...\".",
+      "- NUNCA uses flags o utilidades exclusivas de Linux que no existan en Windows (como ping con sintaxis POSIX o herramientas no instaladas en PATH).",
+    ].join("\n");
+  }
+  if (platform === "linux") {
+    return [
+      "ENTORNO DE EJECUCIÓN (LINUX): La máquina donde operas es un servidor LINUX real del usuario.",
+      "Tu herramienta de ejecución (terminal, Bash o similar) ejecuta directamente en el entorno Linux.",
+      "- Rutas: Usa rutas estándar POSIX (ej: /home/... o /tmp/...).",
+      "- Comandos: Emplea utilidades estándar de Linux (cat, sed, grep, ls, python3, curl, etc.).",
+    ].join("\n");
+  }
+  return [
+    "ENTORNO DE EJECUCIÓN (DUAL / ADAPTABLE): Tus herramientas ejecutan directamente en la máquina del usuario (Linux o Windows).",
+    "- Identifica el sistema operativo a partir del contexto del proyecto (ej: rutas /home/... indican Linux; rutas C:\\... o /c/Users/... indican Windows).",
+    "- Ejecuta siempre los comandos y sintaxis nativos correspondientes a ese sistema operativo sin mezclar comandos de plataformas incompatibles.",
+  ].join("\n");
+}
+
+function agentSystemPrompt(tools, modelId, transport, platform) {
   const defs = toolDefsForWorker(tools);
   if (!defs.length) return "";
   const isAnthropic = transport === "anthropic" || (typeof modelId === "string" && /claude/i.test(modelId));
+  const plat = platform || "auto";
+  const platText = platformInstruction(plat);
 
   if (isAnthropic) {
     const lines = defs.map((d) => `- <tool_description>\n<name>${d.name}</name>\n<description>${d.description}</description>\n<parameters>${JSON.stringify(d.params)}</parameters>\n</tool_description>`);
     return [
       "INSTRUCCIONES PARA EL USO DE HERRAMIENTAS:",
       "Tienes acceso real y directo a herramientas del sistema para interactuar con el entorno, archivos y procesos.",
-      "ACCESO TOTAL: Si el usuario te pide inspeccionar, leer, crear, editar o buscar archivos, o ejecutar comandos en el sistema, DEBES invocar la herramienta correspondiente. NUNCA digas que no tienes acceso, NUNCA pidas que te peguen el contenido manualmente, y NUNCA generes simulaciones ni tutoriales ficticios.",
+      "PROCEDENCIA Y ENTORNO REAL: Estás conectado directamente al entorno y sistema operativo real del usuario. Tienes acceso completo a la red, procesos y sistema de archivos a través de tus herramientas autorizadas. NUNCA asumas que estás en un sandbox aislado sin internet, NUNCA inventes limitaciones que no existen, y NUNCA pidas que te peguen archivos manualmente cuando tienes herramientas para consultarlos o crearlos.",
       "HERRAMIENTAS VÁLIDAS: ÚNICAMENTE puedes invocar las herramientas que figuran en el catálogo de herramientas disponibles. No inventes nombres inexistentes.",
-      "OPERACIONES EN EL SISTEMA: Si tu herramienta disponible es \x27terminal\x27 (o \x27Bash\x27/\x27bash\x27) y necesitas leer o modificar archivos o inspeccionar el entorno, ejecuta comandos estándar de Linux (cat, sed, grep, ls, python3, etc.) a través de \x27terminal\x27.",
+      platText,
       "FORMATO DE LLAMADA: Para invocar una herramienta, responde usando el formato de etiquetas XML estándar:",
       "<tool_use>",
       "<name>nombre_herramienta</name>",
@@ -1246,9 +1298,9 @@ function agentSystemPrompt(tools, modelId, transport) {
   return [
     "INSTRUCCIONES PARA EL USO DE HERRAMIENTAS:",
     "Tienes herramientas reales conectadas al entorno para interactuar con el sistema operativo, archivos y procesos.",
-    "ACCESO AL SISTEMA Y ARCHIVOS: Tienes acceso total. Si el usuario te pide leer, inspeccionar, editar o buscar archivos, configs, scripts o ejecutar comandos del sistema, DEBES usar la herramienta correspondiente de tu catálogo. NUNCA digas que no tienes acceso, NUNCA pidas que te peguen el contenido, y NUNCA generes tutoriales o simulaciones ficticias cuando se te pide una acción real.",
+    "PROCEDENCIA Y ENTORNO REAL: Estás conectado directamente al entorno y sistema operativo real del usuario. Tienes acceso completo a la red, procesos y sistema de archivos a través de tus herramientas autorizadas. NUNCA asumas que estás en un sandbox aislado sin internet, NUNCA inventes limitaciones que no existen, y NUNCA pidas que te peguen archivos manualmente cuando tienes herramientas para consultarlos o crearlos.",
     "PROHIBIDO INVENTAR HERRAMIENTAS: ÚNICAMENTE puedes invocar las herramientas que figuran en la lista de \x27Herramientas disponibles en este entorno\x27. NUNCA inventes nombres como file_edit, file_write o similares si no están en tu lista.",
-    "OPERACIONES DE ARCHIVOS Y CONFIGURACIÓN: Si tu herramienta disponible es \x27terminal\x27 (o \x27Bash\x27/\x27bash\x27) y necesitas leer, inspeccionar, crear o modificar archivos en el sistema, ejecuta directamente comandos estándar de Linux (como cat, sed, grep, python3, tee, echo, ls) a través de \x27terminal\x27.",
+    platText,
     "FORMATO DE LLAMADA: Cuando decidas invocar una herramienta, emite la llamada en formato <tool_call> o bloque JSON:",
     "<tool_call>",
     "{\"name\": \"nombre_herramienta\", \"arguments\": {\"parametro\": \"valor\"}}",
@@ -1406,9 +1458,10 @@ async function handleResponses(req, res, body, requestId) {
   // Modo agéntico: si el cliente ofrece tools tipo function, inyectar
   // catálogo como prompt sistema para que el worker emita EXEC::: y
   // convertirlo a function_call nativo.
+  const platform = detectClientPlatform(req, body);
   const fnTools = Array.isArray(body.tools) ? body.tools.filter((t) => t && t.type === "function" && t.name) : [];
   if (fnTools.length && body.tool_choice !== "none") {
-    const sys = agentSystemPrompt(body.tools, body.model, "openai");
+    const sys = agentSystemPrompt(body.tools, body.model, "openai", platform);
     if (sys) workerMessages = [{ role: "system", content: sys }, ...workerMessages];
   }
   let resolved;
@@ -1620,10 +1673,11 @@ async function handleMessages(req, res, body, requestId) {
 
   // Puente tool-use Anthropic: tools [{name, description, input_schema}]
   // (TRANSPORTE, no ejecución — el harness cliente ejecuta).
+  const platform = detectClientPlatform(req, body);
   const antTools = Array.isArray(body.tools) ? body.tools : [];
   const antChoice = body.tool_choice;
   const antDisabled = antChoice && (antChoice.type === "none" || antChoice === "none");
-  const antToolSys = (antDefs.length && !antDisabled) ? agentSystemPrompt(antTools, model, "anthropic") : "";
+  const antToolSys = (antDefs.length && !antDisabled) ? agentSystemPrompt(antTools, model, "anthropic", platform) : "";
   const combinedAntSys = [antToolSys, body.system].filter(Boolean);
   const wmAnt = toWorkerMessagesAnt(combinedAntSys, body.messages);
 
