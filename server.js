@@ -1219,16 +1219,18 @@ function agentSystemPrompt(tools) {
   if (!defs.length) return "";
   const lines = defs.map((d) => `- ${d.name}: ${d.description} params=${JSON.stringify(d.params).slice(0, 800)}`);
   return [
-    // Protocolo nativo de herramientas para el harness cliente (Claude Code, Hermes, OpenCode, Codex).
     "INSTRUCCIONES CRÍTICAS PARA HERRAMIENTAS:",
     "Tienes herramientas reales conectadas al entorno para interactuar con el sistema operativo, archivos y procesos.",
-    "ACCESO AL SISTEMA Y ARCHIVOS: Tienes acceso total. Si el usuario te pide leer, inspeccionar o buscar archivos (ej: código, scripts, configs en el workspace o carpetas del sistema), o ejecutar comandos del sistema, DEBES usar la herramienta correspondiente de tu catálogo. NUNCA digas que no tienes acceso, NUNCA pidas que te peguen el contenido, y NUNCA generes scripts de prueba ficticios o simulaciones cuando se te pide una acción real.",
-    "REGLA DE ORO: Cuando decidas invocar una herramienta, responde ÚNICAMENTE con el bloque de ejecución en su propia línea, SIN explicaciones previas, SIN preámbulos conversacionales, y SIN pedir disculpas.",
-    "Formato de llamada exacto (en una sola línea):",
+    "ACCESO AL SISTEMA Y ARCHIVOS: Tienes acceso total. Si el usuario te pide leer, inspeccionar, editar o buscar archivos, configs, scripts o ejecutar comandos del sistema, DEBES usar la herramienta correspondiente de tu catálogo. NUNCA digas que no tienes acceso, NUNCA pidas que te peguen el contenido, y NUNCA generes tutoriales o simulaciones ficticias cuando se te pide una acción real.",
+    "PROHIBIDO INVENTAR HERRAMIENTAS: ÚNICAMENTE puedes invocar las herramientas que figuran en la lista de \x27Herramientas disponibles en este entorno\x27. NUNCA inventes nombres como file_edit, file_write o similares si no están en tu lista.",
+    "OPERACIONES DE ARCHIVOS Y CONFIGURACIÓN: Si tu herramienta disponible es \x27terminal\x27 (o \x27Bash\x27/\x27bash\x27) y necesitas leer, inspeccionar, crear o modificar archivos en el sistema, ejecuta directamente comandos estándar de Linux (como cat, sed, grep, python3, tee, echo, ls) a través de \x27terminal\x27.",
+    "REGLA DE ORO: Cuando decidas invocar una herramienta, responde ÚNICAMENTE con el bloque de ejecución en su propia línea, SIN explicaciones previas, SIN preámbulos conversacionales, SIN pedir disculpas, y NUNCA encierres el bloque EXEC::: dentro de bloques de código markdown (```bash o ```).",
+    "NUNCA finjas haber completado una tarea (\x27Acciones completadas\x27) sin haber ejecutado la herramienta real que la realiza.",
+    "Formato de llamada exacto:",
     "EXEC:::<nombre_herramienta> ARGS <json con los parámetros exactos requeridos por la herramienta>",
     "Herramientas disponibles en este entorno:",
     ...lines,
-    "Si la consulta no requiere herramientas (por ejemplo dar explicaciones teóricas, conceptos o responder preguntas generales), responde normalmente en texto plano o markdown SIN bloques EXEC.",
+    "Si la consulta no requiere herramientas (ej: dar explicaciones teóricas, conceptos o responder preguntas generales), responde normalmente en texto plano o markdown SIN bloques EXEC.",
   ].join("\n");
 }
 
