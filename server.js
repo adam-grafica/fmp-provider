@@ -849,15 +849,24 @@ async function handleChatCompletions(req, res, body, requestId) {
   const t0 = Date.now();
   trace(`${logTag} START-LIVE msgs=${wm.length} tools=${oaiDefs.length} full=${fullMode}`);
   if (fullMode) {
+    res.writeHead(200, sseHeaders(req));
+    const stopHeartbeat = startHeartbeat(res, req, logTag);
+    const fsend = (obj) => res.write("data: " + JSON.stringify(obj) + "\n\n");
+    fsend({ id, object: "chat.completion.chunk", created, model, choices: [{ index: 0, delta: { role: "assistant" }, finish_reason: null }] });
+
     let got;
     try {
       got = await getOAIText();
     } catch (e) {
+      stopHeartbeat();
       routeErr();
       release();
       const s = SEC.sanitizeUpstreamError(e, requestId);
-      return openaiError(res, s.status, s.message, "upstream_error", req);
+      fsend({ id, object: "chat.completion.chunk", created, model, choices: [{ index: 0, delta: {}, finish_reason: "error" }] });
+      res.write("data: [DONE]\n\n");
+      return res.end();
     }
+    stopHeartbeat();
     recordLatency(ROUTE, Date.now() - T0);
     const capped = applyMaxTokens(got.text, maxTokens);
     if (capped.hit) trace(`${logTag} MAXTOKENS cut=${got.text.length}->${capped.text.length}`);
@@ -866,13 +875,10 @@ async function handleChatCompletions(req, res, body, requestId) {
     usage[tier].tokens += estTokens(ftext);
 
     const tc0 = hasTools ? await resolveToolCall(ftext, oaiDefs, wm, model, logTag) : null;
-    res.writeHead(200, sseHeaders(req));
-    const fsend = (obj) => res.write("data: " + JSON.stringify(obj) + "\n\n");
-    fsend({ id, object: "chat.completion.chunk", created, model, choices: [{ index: 0, delta: { role: "assistant" }, finish_reason: null }] });
 
     if (tc0) {
       if (tc0.prefixText) {
-        const CH = 48;
+        const CH = 32;
         for (let i = 0; i < tc0.prefixText.length; i += CH) {
           fsend({ id, object: "chat.completion.chunk", created, model, choices: [{ index: 0, delta: { content: tc0.prefixText.slice(i, i + CH) }, finish_reason: null }] });
         }
@@ -882,7 +888,7 @@ async function handleChatCompletions(req, res, body, requestId) {
       fsend({ id, object: "chat.completion.chunk", created, model, choices: [{ index: 0, delta: {}, finish_reason: "tool_calls" }] });
       trace(`${logTag} SERVED-TOOL-STREAM-OAI name=${tc0.name} elapsed=${Date.now() - t0}ms`);
     } else {
-      const CH = 48;
+      const CH = 32;
       for (let i = 0; i < ftext.length; i += CH) {
         fsend({ id, object: "chat.completion.chunk", created, model, choices: [{ index: 0, delta: { content: ftext.slice(i, i + CH) }, finish_reason: null }] });
       }
@@ -1242,26 +1248,26 @@ function detectClientPlatform(req, body) {
 function platformInstruction(platform) {
   if (platform === "windows") {
     return [
-      "ENTORNO DE EJECUCIÓN (WINDOWS): La máquina donde operas es un sistema WINDOWS real del usuario.",
-      "Tu herramienta de ejecución (Bash, terminal o similar) ejecuta en el entorno Windows del usuario (a menudo mediante Git-Bash o PowerShell).",
-      "- Rutas: Usa rutas compatibles con el entorno Windows (ej: C:\\Users\\... o /c/Users/...).",
-      "- Comandos: Usa comandos válidos para Windows / Git-Bash (ej: python, powershell, curl, dir, type, git). Si necesitas invocar PowerShell desde bash, ejecuta: powershell.exe -NoProfile -Command \"...\".",
-      "- NUNCA uses flags o utilidades exclusivas de Linux que no existan en Windows (como ping con sintaxis POSIX o herramientas no instaladas en PATH).",
+      "SISTEMA OPERATIVO ACTIVO: WINDOWS (Entorno real del usuario).",
+      "Estás operando directamente sobre Windows con terminal/PowerShell/Git-Bash.",
+      "- Rutas: Usa rutas compatibles con Windows (ej: C:\\Users\\... o /c/Users/...).",
+      "- Comandos: Usa comandos válidos para Windows / Git-Bash (ej: dir, python, powershell, git, type, curl). Para comandos PowerShell complejos desde bash: powershell.exe -NoProfile -Command \"...\".",
+      "- NUNCA uses comandos exclusivos de Linux no portados a Windows.",
     ].join("\n");
   }
   if (platform === "linux") {
     return [
-      "ENTORNO DE EJECUCIÓN (LINUX): La máquina donde operas es un servidor LINUX real del usuario.",
-      "Tu herramienta de ejecución (terminal, Bash o similar) ejecuta directamente en el entorno Linux.",
+      "SISTEMA OPERATIVO ACTIVO: LINUX (Entorno real del usuario).",
+      "Estás operando directamente sobre un sistema Linux nativo con bash.",
       "- Rutas: Usa rutas estándar POSIX (ej: /home/... o /tmp/...).",
-      "- Comandos: Emplea utilidades estándar de Linux (cat, sed, grep, ls, python3, curl, etc.).",
-      "- Scripts de Python en terminal: Usa siempre módulos estándar del sistema (os, sys, subprocess, requests, urllib, json, etc.). NUNCA intentes importar módulos virtuales o ficticios como 'hermes_tools' dentro de la terminal; 'terminal' corre directamente en el Linux real.",
+      "- Comandos: Emplea utilidades estándar de Linux (cat, ls, sed, grep, python3, curl, git, etc.).",
+      "- En la terminal: Ejecuta comandos y scripts de Python estándar (os, sys, subprocess, requests, json, etc.). NUNCA intentes importar librerías ficticias o simuladas como 'hermes_tools' dentro de la terminal Linux real.",
     ].join("\n");
   }
   return [
-    "ENTORNO DE EJECUCIÓN (DUAL / ADAPTABLE): Tus herramientas ejecutan directamente en la máquina del usuario (Linux o Windows).",
-    "- Identifica el sistema operativo a partir del contexto del proyecto (ej: rutas /home/... indican Linux; rutas C:\\... o /c/Users/... indican Windows).",
-    "- Ejecuta siempre los comandos y sintaxis nativos correspondientes a ese sistema operativo sin mezclar comandos de plataformas incompatibles.",
+    "SISTEMA OPERATIVO ACTIVO: DETECCIÓN ADAPTABLE (Linux o Windows).",
+    "- Identifica el sistema operativo a partir de las rutas en el contexto (/home/... indica Linux; C:\\... o /c/Users/... indica Windows).",
+    "- Ejecuta siempre los comandos nativos de la plataforma correspondiente.",
   ].join("\n");
 }
 
@@ -1271,16 +1277,26 @@ function agentSystemPrompt(tools, modelId, transport, platform) {
   const isAnthropic = transport === "anthropic" || (typeof modelId === "string" && /claude/i.test(modelId));
   const plat = platform || "auto";
   const platText = platformInstruction(plat);
+  const toolNames = defs.map((d) => d.name).join(", ");
+
+  const commonGrounding = [
+    "IDENTIDAD Y ENTORNO:",
+    "- Eres el OPERADOR LOCAL DIRECTO integrado dentro de este sistema.",
+    "- Estás conectado de forma directa y nativa al host del usuario con ACCESO TOTAL a través de tus herramientas.",
+    "- PROHIBIDO DISTANCIAMIENTO: NUNCA digas frases como 'desde acá te sugiero', 'en tu lugar ejecutaría', 'no tengo acceso a tu máquina', 'te recomiendo que corras' o 'no sé en tu lugar'.",
+    "- PROHIBIDO PEDIR ACCIONES AL USUARIO: NUNCA le pidas al usuario que ejecute comandos, inspeccione archivos o copie resultados manualmente cuando dispones de herramientas para hacerlo.",
+    "- ACCIÓN DIRECTA OBLIGATORIA: Si una tarea requiere inspeccionar, listar, leer, crear, modificar o ejecutar cualquier acción en el sistema: INVOCA LA HERRAMIENTA ADECUADA DIRECTAMENTE sin rodeos.",
+    "- Piensa y razona brevemente lo que vas a hacer y luego ejecuta la herramienta correspondiente.",
+    `CATÁLOGO AUTORIZADO DE HERRAMIENTAS: [${toolNames}].`,
+    "PROHIBIDO INVENTAR HERRAMIENTAS: Únicamente puedes invocar herramientas que existan en este catálogo.",
+    platText,
+  ];
 
   if (isAnthropic) {
     const lines = defs.map((d) => `- <tool_description>\n<name>${d.name}</name>\n<description>${d.description}</description>\n<parameters>${JSON.stringify(d.params)}</parameters>\n</tool_description>`);
     return [
-      "INSTRUCCIONES PARA EL USO DE HERRAMIENTAS:",
-      "Tienes acceso real y directo a herramientas del sistema para interactuar con el entorno, archivos y procesos.",
-      "PROCEDENCIA Y ENTORNO REAL: Estás conectado directamente al entorno y sistema operativo real del usuario. Tienes acceso completo a la red, procesos y sistema de archivos a través de tus herramientas autorizadas. NUNCA asumas que estás en un sandbox aislado sin internet ni simules limitaciones que no existen. Ejecuta directamente los comandos requeridos sin pedir que el usuario lo haga por ti.",
-      "HERRAMIENTAS VÁLIDAS: ÚNICAMENTE puedes invocar las herramientas que figuran en el catálogo de herramientas disponibles. No inventes nombres inexistentes.",
-      platText,
-      "FORMATO DE LLAMADA: Para invocar una herramienta, responde usando el formato de etiquetas XML estándar:",
+      ...commonGrounding,
+      "FORMATO DE LLAMADA: Para invocar una herramienta, emite las etiquetas XML estándar:",
       "<tool_use>",
       "<name>nombre_herramienta</name>",
       "<arguments>",
@@ -1289,7 +1305,7 @@ function agentSystemPrompt(tools, modelId, transport, platform) {
       "</tool_use>",
       "(También se acepta: EXEC:::nombre_herramienta ARGS { ... })",
       "NUNCA finjas haber completado una tarea sin haber ejecutado la herramienta real que la realiza.",
-      "Herramientas disponibles:",
+      "Especificación de herramientas disponibles:",
       ...lines,
       "Si la consulta del usuario no requiere herramientas (preguntas conceptuales, explicaciones teóricas), responde normalmente en texto o markdown sin invocar herramientas.",
     ].join("\n");
@@ -1297,18 +1313,14 @@ function agentSystemPrompt(tools, modelId, transport, platform) {
 
   const lines = defs.map((d) => `- ${d.name}: ${d.description} params=${JSON.stringify(d.params).slice(0, 800)}`);
   return [
-    "INSTRUCCIONES PARA EL USO DE HERRAMIENTAS:",
-    "Tienes herramientas reales conectadas al entorno para interactuar con el sistema operativo, archivos y procesos.",
-    "PROCEDENCIA Y ENTORNO REAL: Estás conectado directamente al entorno y sistema operativo real del usuario. Tienes acceso completo a la red, procesos y sistema de archivos a través de tus herramientas autorizadas. NUNCA asumas que estás en un sandbox aislado sin internet, NUNCA inventes limitaciones que no existen, y NUNCA pidas que te peguen archivos manualmente cuando tienes herramientas para consultarlos o crearlos.",
-    "PROHIBIDO INVENTAR HERRAMIENTAS: ÚNICAMENTE puedes invocar las herramientas que figuran en la lista de \x27Herramientas disponibles en este entorno\x27. NUNCA inventes nombres como file_edit, file_write o similares si no están en tu lista.",
-    platText,
+    ...commonGrounding,
     "FORMATO DE LLAMADA: Cuando decidas invocar una herramienta, emite la llamada en formato <tool_call> o bloque JSON:",
     "<tool_call>",
     "{\"name\": \"nombre_herramienta\", \"arguments\": {\"parametro\": \"valor\"}}",
     "</tool_call>",
     "(También se acepta: EXEC:::nombre_herramienta ARGS { ... })",
     "NUNCA finjas haber completado una tarea sin haber ejecutado la herramienta real que la realiza.",
-    "Herramientas disponibles en este entorno:",
+    "Especificación de herramientas disponibles:",
     ...lines,
     "Si la consulta no requiere herramientas (ej: explicaciones teóricas, conceptos o preguntas generales), responde normalmente en texto plano o markdown sin invocar herramientas.",
   ].join("\n");
@@ -1687,6 +1699,12 @@ async function handleMessages(req, res, body, requestId) {
     const hasTools = antDefs.length && !antDisabled;
   const fullMode = body.stream_mode === "full" || (hasTools && stream);
   if (fullMode && stream) {
+    res.writeHead(200, sseHeaders(req));
+    const stopHeartbeat = startHeartbeat(res, req, logTag);
+    const fsend = (obj) => res.write("event: " + obj._ev + "\ndata: " + JSON.stringify(obj._d) + "\n\n");
+    const fev = (name, d) => ({ _ev: name, _d: d });
+    fsend(fev("message_start", { type: "message_start", message: { id: msgId, type: "message", role: "assistant", model, content: [], stop_reason: null, stop_sequence: null, usage: { input_tokens: inputTokens, output_tokens: 1 } } }));
+
     let got;
     try {
       const r = await fetchCompleteText({ messages: wmAnt, modelId: model, thinking, deepSearch: false, signal: null, logTag, route: ROUTE, timeoutMs: TIMEOUT });
@@ -1698,11 +1716,14 @@ async function handleMessages(req, res, body, requestId) {
         } catch { return r.text; }
       })());
     } catch (e) {
+      stopHeartbeat();
       routeErr();
       release();
       const s = SEC.sanitizeUpstreamError(e, requestId);
-      return anthropicError(res, s.status, s.message, req);
+      fsend(fev("error", { type: "error", error: { type: "api_error", message: s.message } }));
+      return res.end();
     }
+    stopHeartbeat();
     recordLatency(ROUTE, Date.now() - T0);
     const capped = applyMaxTokens(got, maxTokens);
     if (capped.hit) trace(`${logTag} MAXTOKENS cut=${got.length}->${capped.text.length}`);
@@ -1710,16 +1731,12 @@ async function handleMessages(req, res, body, requestId) {
     usage[tier].tokens += estTokens(ftext);
 
     const tc0 = hasTools ? await resolveToolCall(ftext, antDefs, wmAnt, model, logTag) : null;
-    res.writeHead(200, sseHeaders(req));
-    const fsend = (obj) => res.write("event: " + obj._ev + "\ndata: " + JSON.stringify(obj._d) + "\n\n");
-    const fev = (name, d) => ({ _ev: name, _d: d });
-    fsend(fev("message_start", { type: "message_start", message: { id: msgId, type: "message", role: "assistant", model, content: [], stop_reason: null, stop_sequence: null, usage: { input_tokens: inputTokens, output_tokens: 1 } } }));
 
     if (tc0) {
       let blockIdx = 0;
       if (tc0.prefixText) {
         fsend(fev("content_block_start", { type: "content_block_start", index: blockIdx, content_block: { type: "text", text: "" } }));
-        const CH = 48;
+        const CH = 32;
         for (let i = 0; i < tc0.prefixText.length; i += CH) {
           fsend(fev("content_block_delta", { type: "content_block_delta", index: blockIdx, delta: { type: "text_delta", text: tc0.prefixText.slice(i, i + CH) } }));
         }
@@ -1736,7 +1753,7 @@ async function handleMessages(req, res, body, requestId) {
     } else {
       const fstop = capped.hit ? "max_tokens" : "end_turn";
       fsend(fev("content_block_start", { type: "content_block_start", index: 0, content_block: { type: "text", text: "" } }));
-      const CH = 48;
+      const CH = 32;
       for (let i = 0; i < ftext.length; i += CH) {
         fsend(fev("content_block_delta", { type: "content_block_delta", index: 0, delta: { type: "text_delta", text: ftext.slice(i, i + CH) } }));
       }
@@ -1748,7 +1765,6 @@ async function handleMessages(req, res, body, requestId) {
     release();
     return res.end();
   }
-
   if (!stream) {
     let got;
     try {
