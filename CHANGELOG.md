@@ -1,5 +1,24 @@
 # FMP Changelog
 
+## v2.3.4 — FRESH TOOL-CALL IDS PER CALL (2026-10-17)
+
+Found with real clients (Claude Code 2.1.301 / OpenCode 1.18.33) running
+the tool test battery against the bridge: on sequential tool turns the
+SAME `tool_use`/`tool_call` id was re-emitted for every new call
+(`findPriorCallId` matched any prior call with the same tool name and
+reused its id). Claude Code then looped: it re-ran the same Bash call up
+to 8 times, the duplicated ids made the upstream history ambiguous, and
+the turn degraded ("parece que hubo un error... intento de nuevo",
+`num_turns=11`).
+
+- Tool-call ids are now minted FRESH on every emitted call, in all six
+  emission paths (OpenAI sync + tool-stream + live-end; Anthropic sync +
+  tool-stream + live-end), exactly like native providers.
+- `findPriorCallId` and the now-dead `priorOpenAICalls`/`priorAnthropicCalls`
+  helpers were removed; the "stable id" idea only ever applied to a
+  retry of the same call, and reusing ids across DIFFERENT calls broke
+  client-side id-based pairing.
+
 ## v2.3.3 — LIVE STREAMING WITH TOOLS & ANTHROPIC THINKING FLAG (2026-10-17)
 
 Professional-chat UX for tool turns: the client sees the answer (and the

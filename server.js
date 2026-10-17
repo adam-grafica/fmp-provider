@@ -820,9 +820,8 @@ async function handleChatCompletions(req, res, body, requestId) {
       // Solo nombres de tools en logs — nunca argumentos (Phase 3).
       trace(`${logTag} TOOL-TRANSPORT n=${rtc.calls.length} names=${rtc.calls.map((c) => c.name).join(",")} (transport only, not executed)`);
       release();
-      const prior = priorOpenAICalls(body);
       const toolCalls = rtc.calls.map((c) => ({
-        id: TOOLS_LIB.findPriorCallId(prior, c.name) || ("call_" + rid().slice(0, 20)),
+        id: "call_" + rid().slice(0, 20),
         type: "function",
         function: { name: c.name, arguments: c.args },
       }));
@@ -891,9 +890,8 @@ async function handleChatCompletions(req, res, body, requestId) {
           fsend({ id, object: "chat.completion.chunk", created, model, choices: [{ index: 0, delta: { content: rtc0.prefixText.slice(i, i + CH) }, finish_reason: null }] });
         }
       }
-      const prior = priorOpenAICalls(body);
       rtc0.calls.forEach((c, idx) => {
-        const tcId = TOOLS_LIB.findPriorCallId(prior, c.name) || ("call_" + rid().slice(0, 20));
+        const tcId = "call_" + rid().slice(0, 20);
         fsend({ id, object: "chat.completion.chunk", created, model, choices: [{ index: 0, delta: { tool_calls: [{ index: idx, id: tcId, type: "function", function: { name: c.name, arguments: c.args } }] }, finish_reason: null }] });
       });
       fsend({ id, object: "chat.completion.chunk", created, model, choices: [{ index: 0, delta: {}, finish_reason: "tool_calls" }] });
@@ -1091,9 +1089,8 @@ async function handleChatCompletions(req, res, body, requestId) {
       const prefixEnd = (typeof rtcLive.matchIndex === "number" && rtcLive.matchIndex >= 0) ? rtcLive.matchIndex : emitted.length;
       const rest = emitted.slice(gate.sentLen, prefixEnd).replace(/`{3}(?:json|xml|bash|sh|zsh)?\s*$/i, "");
       if (rest.trim()) streamText(rest);
-      const prior = priorOpenAICalls(body);
       rtcLive.calls.forEach((c, idx) => {
-        const tcId = TOOLS_LIB.findPriorCallId(prior, c.name) || ("call_" + rid().slice(0, 20));
+        const tcId = "call_" + rid().slice(0, 20);
         send({ id, object: "chat.completion.chunk", created, model, choices: [{ index: 0, delta: { tool_calls: [{ index: idx, id: tcId, type: "function", function: { name: c.name, arguments: c.args } }] }, finish_reason: null }] });
       });
       send({ id, object: "chat.completion.chunk", created, model, choices: [{ index: 0, delta: {}, finish_reason: "tool_calls" }] });
@@ -1198,33 +1195,6 @@ function extractShellBlock(text) {
   if (!cmd || cmd.length > 2000 || cmd.includes("\n\n\n")) return null;
   // Evitar bloques que son claramente ilustrativos múltiples: solo el primero.
   return cmd;
-}
-
-// Prior client-supplied calls, por transporte, para reusar ids estables
-// en turnos continuados. (Histórico: se leía body.tool_calls, campo que
-// no existe en los requests — los ids se regeneraban siempre.)
-function priorOpenAICalls(body) {
-  const out = [];
-  const msgs = (body && Array.isArray(body.messages) && body.messages) || [];
-  for (const m of msgs) {
-    if (m && m.role === "assistant" && Array.isArray(m.tool_calls)) {
-      const r = TOOLS_LIB.openAICallsToInternal(m.tool_calls);
-      if (r.ok) out.push(...r.calls);
-    }
-  }
-  return out;
-}
-
-function priorAnthropicCalls(body) {
-  const out = [];
-  const msgs = (body && Array.isArray(body.messages) && body.messages) || [];
-  for (const m of msgs) {
-    if (m && m.role === "assistant" && Array.isArray(m.content)) {
-      const r = TOOLS_LIB.anthropicBlocksToInternal(m.content);
-      if (r.ok) out.push(...r.calls);
-    }
-  }
-  return out;
 }
 
 // Resuelve llamadas a herramientas con 3 niveles (TRANSPORTE, no ejecución):
@@ -1867,9 +1837,8 @@ async function handleMessages(req, res, body, requestId) {
         fsend(fev("content_block_stop", { type: "content_block_stop", index: blockIdx }));
         blockIdx++;
       }
-      const priorAnt = priorAnthropicCalls(body);
       for (const c of tc0.calls) {
-        const tuId = TOOLS_LIB.findPriorCallId(priorAnt, c.name) || ("toolu_" + rid().slice(0, 20));
+        const tuId = "toolu_" + rid().slice(0, 20);
         fsend(fev("content_block_start", { type: "content_block_start", index: blockIdx, content_block: { type: "tool_use", id: tuId, name: c.name, input: {} } }));
         fsend(fev("content_block_delta", { type: "content_block_delta", index: blockIdx, delta: { type: "input_json_delta", partial_json: c.args } }));
         fsend(fev("content_block_stop", { type: "content_block_stop", index: blockIdx }));
@@ -1921,13 +1890,12 @@ async function handleMessages(req, res, body, requestId) {
     if (rtcA.calls.length) {
       content0 = [];
       if (rtcA.prefixText) content0.push({ type: "text", text: rtcA.prefixText });
-      const priorAnt = priorAnthropicCalls(body);
       for (const c of rtcA.calls) {
         let input = {};
         try { input = JSON.parse(c.args); } catch { input = {}; }
         content0.push({
           type: "tool_use",
-          id: TOOLS_LIB.findPriorCallId(priorAnt, c.name) || ("toolu_" + rid().slice(0, 20)),
+          id: "toolu_" + rid().slice(0, 20),
           name: c.name,
           input,
         });
@@ -2135,10 +2103,9 @@ async function handleMessages(req, res, body, requestId) {
       const rest = emitted.slice(gate.sentLen, prefixEnd).replace(/`{3}(?:json|xml|bash|sh|zsh)?\s*$/i, "");
       if (rest.trim()) streamAntText(rest);
       send(ev("content_block_stop", { type: "content_block_stop", index: 0 }));
-      const priorAnt = priorAnthropicCalls(body);
       let blockIdx = 1;
       for (const c of rtcLive.calls) {
-        const tuId = TOOLS_LIB.findPriorCallId(priorAnt, c.name) || ("toolu_" + rid().slice(0, 20));
+        const tuId = "toolu_" + rid().slice(0, 20);
         send(ev("content_block_start", { type: "content_block_start", index: blockIdx, content_block: { type: "tool_use", id: tuId, name: c.name, input: {} } }));
         send(ev("content_block_delta", { type: "content_block_delta", index: blockIdx, delta: { type: "input_json_delta", partial_json: c.args } }));
         send(ev("content_block_stop", { type: "content_block_stop", index: blockIdx }));

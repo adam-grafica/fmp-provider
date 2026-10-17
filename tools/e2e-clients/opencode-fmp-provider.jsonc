@@ -1,0 +1,25 @@
+{
+  "$schema": "https://opencode.ai/config.json",
+  "provider": {
+    "fmp": {
+      "npm": "@ai-sdk/openai-compatible",
+      "name": "FMP Bridge",
+      "options": {
+        "baseURL": "http://127.0.0.1:2089/v1",
+        "apiKey": "fmp-test"
+      },
+      "models": {
+        "sol": { "name": "sol (FMP)" },
+        "terra": { "name": "terra (FMP)" },
+        "claude-sonnet-5": { "name": "claude-sonnet-5 (FMP)" }
+      }
+    }
+  },
+  "model": "fmp/sol",
+  "small_model": "fmp/sol",
+  "permission": {
+    "edit": "allow",
+    "bash": "allow",
+    "webfetch": "allow"
+  }
+}

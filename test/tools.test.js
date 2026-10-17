@@ -68,8 +68,6 @@ test("unit: ids preserved across normalization", () => {
   assert.equal(norm.calls[0].id, "call_keep1");
   const back = T.internalToOpenAI(norm.calls);
   assert.equal(back[0].id, "call_keep1");
-  const prior = T.findPriorCallId(norm.calls, "a");
-  assert.equal(prior, "call_keep1");
 });
 
 test("unit: unknown EXEC tool rejected (no phantom calls)", () => {
