@@ -388,7 +388,7 @@ function toWorkerMessagesAnt(system, messages) {
           if (p && p.type === "tool_result") {
             const rawRes = p.content !== undefined ? p.content : p.output;
             const resStr = typeof rawRes === "string" ? rawRes : (Array.isArray(rawRes) ? textOfContent(rawRes) : JSON.stringify(rawRes ?? ""));
-            toolResults.push(`[resultado de herramienta ${p.tool_use_id || ""}]:\n${resStr}`);
+            toolResults.push(`[resultado de herramienta ${p.tool_use_id || ""}${p.is_error ? " (ERROR)" : ""}]:\n${resStr}`);
           } else if (p && p.text) {
             toolResults.push(p.text);
           }
@@ -755,8 +755,10 @@ async function handleChatCompletions(req, res, body, requestId) {
   const maxTokens = Math.min(effMaxTokens(body.max_tokens ?? body.max_completion_tokens, 4096), HARNESS_CAP);
   const hasTools = oaiDefs.length && body.tool_choice !== "none";
   // stream_mode full: bufferiza íntegro y luego emite SSE (para rachas
-  // malas de upstream o cuando hay tools activas para resolución limpia).
-  const fullMode = body.stream_mode === "full" || (hasTools && stream);
+  // malas de upstream). Con tools el default ahora es LIVE + gate de
+  // marcador (v2.3.3): el texto se ve en vivo y el bloque de protocolo
+  // se retiene hasta resolver la llamada al final del turno.
+  const fullMode = body.stream_mode === "full";
 
   const id = "chatcmpl-" + rid();
   const created = Math.floor(Date.now() / 1000);
@@ -768,7 +770,13 @@ async function handleChatCompletions(req, res, body, requestId) {
   // el harness cliente ejecuta y devuelve el resultado.
   const platform = detectClientPlatform(req, body);
   const oaiTools = Array.isArray(body.tools) ? body.tools : [];
-  const oaiToolSys = (oaiDefs.length && body.tool_choice !== "none") ? agentSystemPrompt(oaiTools, model, "openai", platform) : "";
+  const oaiChoice = body.tool_choice;
+  let oaiForced = null;
+  let oaiRequired = false;
+  if (oaiChoice === "required") oaiRequired = true;
+  else if (oaiChoice && typeof oaiChoice === "object" && oaiChoice.type === "function" && oaiChoice.function && typeof oaiChoice.function.name === "string") oaiForced = oaiChoice.function.name;
+  if (oaiForced && !oaiDefs.some((d) => d.name === oaiForced)) oaiForced = null;
+  const oaiToolSys = (oaiDefs.length && oaiChoice !== "none") ? agentSystemPrompt(oaiTools, model, "openai", platform, { forcedToolName: oaiForced, requireTool: oaiRequired }) : "";
   const oaiInputMsgs = oaiToolSys ? [{ role: "system", content: oaiToolSys }, ...(body.messages || [])] : (body.messages || []);
   const wm = toWorkerMessagesOA(oaiInputMsgs);
 
@@ -807,22 +815,22 @@ async function handleChatCompletions(req, res, body, requestId) {
     const capped = applyMaxTokens(got.text, maxTokens);
     if (capped.hit) trace(`${logTag} MAXTOKENS cut=${got.text.length}->${capped.text.length}`);
     got = { text: capped.text, complete: got.complete, finish: capped.hit ? "length" : got.finish };
-    const tc = oaiDefs.length ? await resolveToolCall(got.text, oaiDefs, wm, model, logTag) : null;
-    if (tc) {
-      // Solo nombre de tool en logs — nunca argumentos (Phase 3).
-      trace(`${logTag} TOOL-TRANSPORT name=${tc.name} (transport only, not executed)`);
+    const rtc = oaiDefs.length ? await resolveToolCalls(got.text, oaiDefs, wm, model, logTag) : { calls: [], prefixText: "" };
+    if (rtc.calls.length) {
+      // Solo nombres de tools en logs — nunca argumentos (Phase 3).
+      trace(`${logTag} TOOL-TRANSPORT n=${rtc.calls.length} names=${rtc.calls.map((c) => c.name).join(",")} (transport only, not executed)`);
       release();
-      const priorId = TOOLS_LIB.findPriorCallId(
-        (TOOLS_LIB.openAICallsToInternal(body.tool_calls || []).calls || []), tc.name);
+      const prior = priorOpenAICalls(body);
+      const toolCalls = rtc.calls.map((c) => ({
+        id: TOOLS_LIB.findPriorCallId(prior, c.name) || ("call_" + rid().slice(0, 20)),
+        type: "function",
+        function: { name: c.name, arguments: c.args },
+      }));
       return sendJson(res, 200, {
         id, object: "chat.completion", created, model,
         choices: [{
           index: 0,
-          message: {
-            role: "assistant",
-            content: tc.prefixText || null,
-            tool_calls: [{ id: priorId || ("call_" + rid().slice(0, 20)), type: "function", function: { name: tc.name, arguments: tc.args } }],
-          },
+          message: { role: "assistant", content: rtc.prefixText || null, tool_calls: toolCalls },
           finish_reason: "tool_calls",
         }],
         usage: { prompt_tokens: estTokens(JSON.stringify(wm)), completion_tokens: estTokens(got.text), total_tokens: 0 },
@@ -874,19 +882,22 @@ async function handleChatCompletions(req, res, body, requestId) {
     const ffinish = capped.hit ? "length" : got.finish;
     usage[tier].tokens += estTokens(ftext);
 
-    const tc0 = hasTools ? await resolveToolCall(ftext, oaiDefs, wm, model, logTag) : null;
+    const rtc0 = hasTools ? await resolveToolCalls(ftext, oaiDefs, wm, model, logTag) : { calls: [], prefixText: "" };
 
-    if (tc0) {
-      if (tc0.prefixText) {
+    if (rtc0.calls.length) {
+      if (rtc0.prefixText) {
         const CH = 32;
-        for (let i = 0; i < tc0.prefixText.length; i += CH) {
-          fsend({ id, object: "chat.completion.chunk", created, model, choices: [{ index: 0, delta: { content: tc0.prefixText.slice(i, i + CH) }, finish_reason: null }] });
+        for (let i = 0; i < rtc0.prefixText.length; i += CH) {
+          fsend({ id, object: "chat.completion.chunk", created, model, choices: [{ index: 0, delta: { content: rtc0.prefixText.slice(i, i + CH) }, finish_reason: null }] });
         }
       }
-      const tcId = "call_" + rid().slice(0, 20);
-      fsend({ id, object: "chat.completion.chunk", created, model, choices: [{ index: 0, delta: { tool_calls: [{ index: 0, id: tcId, type: "function", function: { name: tc0.name, arguments: tc0.args } }] }, finish_reason: null }] });
+      const prior = priorOpenAICalls(body);
+      rtc0.calls.forEach((c, idx) => {
+        const tcId = TOOLS_LIB.findPriorCallId(prior, c.name) || ("call_" + rid().slice(0, 20));
+        fsend({ id, object: "chat.completion.chunk", created, model, choices: [{ index: 0, delta: { tool_calls: [{ index: idx, id: tcId, type: "function", function: { name: c.name, arguments: c.args } }] }, finish_reason: null }] });
+      });
       fsend({ id, object: "chat.completion.chunk", created, model, choices: [{ index: 0, delta: {}, finish_reason: "tool_calls" }] });
-      trace(`${logTag} SERVED-TOOL-STREAM-OAI name=${tc0.name} elapsed=${Date.now() - t0}ms`);
+      trace(`${logTag} SERVED-TOOL-STREAM-OAI n=${rtc0.calls.length} names=${rtc0.calls.map((c) => c.name).join(",")} elapsed=${Date.now() - t0}ms`);
     } else {
       const CH = 32;
       for (let i = 0; i < ftext.length; i += CH) {
@@ -913,6 +924,17 @@ async function handleChatCompletions(req, res, body, requestId) {
   const maxChars = Math.floor(maxTokens * 4);
   const ctrl = new AbortController();
   req.on("close", () => { try { ctrl.abort(); } catch {} });
+  const streamText = (piece) => {
+    if (!piece || closed) return;
+    const CH = 48;
+    for (let k = 0; k < piece.length && !closed; k += CH) {
+      send({ id, object: "chat.completion.chunk", created, model, choices: [{ index: 0, delta: { content: piece.slice(k, k + CH) }, finish_reason: null }] });
+    }
+  };
+  // Gate de marcador (v2.3.3): con tools declaradas el texto fluye EN VIVO
+  // y se retiene solo desde que aparece un marcador de tool; sin tools no
+  // hay conversión posible y todo fluye directo.
+  const gate = makeToolGate({ enabled: hasTools, onText: streamText, logTag });
   const emitNovel = (novel) => {
     if (!novel || closed) return;
     let piece = novel;
@@ -922,7 +944,7 @@ async function handleChatCompletions(req, res, body, requestId) {
     }
     if (piece) {
       emitted += piece;
-      send({ id, object: "chat.completion.chunk", created, model, choices: [{ index: 0, delta: { content: piece }, finish_reason: null }] });
+      gate.feed(emitted);
     }
     if (cappedHit) { try { ctrl.abort(); } catch {} }
   };
@@ -1032,12 +1054,7 @@ async function handleChatCompletions(req, res, body, requestId) {
           trace(`${logTag} LIVE CONTINUE-STALLED total=${emitted.length} -> close honest`);
           break;
         }
-        if (novel && !closed && !cappedHit) {
-          emitted += novel;
-          for (let k = 0; k < novel.length; k += 48) {
-            send({ id, object: "chat.completion.chunk", created, model, choices: [{ index: 0, delta: { content: novel.slice(k, k + 48) }, finish_reason: null }] });
-          }
-        }
+        if (novel && !closed && !cappedHit) emitNovel(novel);
         if (cont.done) {
           complete = !cappedHit;
           continued = true;
@@ -1063,24 +1080,27 @@ async function handleChatCompletions(req, res, body, requestId) {
     // de continuar (evidencia), así que cualquier pegado sería
     // Frankenstein. Cierre honesto: complete->stop, corte->length,
     // cap de max_tokens->length (como API nativa).
-    let finalReason = cappedHit ? "length" : (complete ? "stop" : "length");
-    // Puente tool-use post-stream (solo si el texto final trae EXEC).
-    let tcLive = oaiDefs.length ? parseToolCall(emitted, oaiDefs) : null;
-    if (!tcLive && oaiDefs.length) {
-      const shellCmd = extractShellBlock(emitted);
-      const execTool = (oaiDefs || []).find((t) => t.name === "exec_command");
-      if (shellCmd && execTool) {
-        const toolName = execTool.name;
-        const args = { cmd: shellCmd };
-        tcLive = { name: toolName, args: JSON.stringify(args) };
-      }
-    }
-    if (tcLive) {
-      const tcId = "call_" + rid().slice(0, 20);
-      send({ id, object: "chat.completion.chunk", created, model, choices: [{ index: 0, delta: { tool_calls: [{ index: 0, id: tcId, type: "function", function: { name: tcLive.name, arguments: tcLive.args } }] }, finish_reason: null }] });
+    const finalReason = cappedHit ? "length" : (complete ? "stop" : "length");
+    // Resolución TRANSPORTE al final del turno (multi-llamada + shell +
+    // FC-RETRY gateado por intención). Con el gate v2.3.3 el texto ya
+    // fluyó en vivo hasta el marcador; acá se vuelca lo retenido y se
+    // emiten los bloques de tool. Si no hay llamada, sale TODO como
+    // texto normal - el gate nunca pierde contenido.
+    const rtcLive = hasTools ? await resolveToolCalls(emitted, oaiDefs, wm, model, logTag) : { calls: [], prefixText: "", matchIndex: -1 };
+    if (rtcLive.calls.length) {
+      const prefixEnd = (typeof rtcLive.matchIndex === "number" && rtcLive.matchIndex >= 0) ? rtcLive.matchIndex : emitted.length;
+      const rest = emitted.slice(gate.sentLen, prefixEnd).replace(/`{3}(?:json|xml|bash|sh|zsh)?\s*$/i, "");
+      if (rest.trim()) streamText(rest);
+      const prior = priorOpenAICalls(body);
+      rtcLive.calls.forEach((c, idx) => {
+        const tcId = TOOLS_LIB.findPriorCallId(prior, c.name) || ("call_" + rid().slice(0, 20));
+        send({ id, object: "chat.completion.chunk", created, model, choices: [{ index: 0, delta: { tool_calls: [{ index: idx, id: tcId, type: "function", function: { name: c.name, arguments: c.args } }] }, finish_reason: null }] });
+      });
       send({ id, object: "chat.completion.chunk", created, model, choices: [{ index: 0, delta: {}, finish_reason: "tool_calls" }] });
-      trace(`${logTag} LIVE TOOL-TRANSPORT name=${tcLive.name} (transport only, not executed)`);
+      trace(`${logTag} LIVE TOOL-TRANSPORT n=${rtcLive.calls.length} names=${rtcLive.calls.map((c) => c.name).join(",")} (transport only, not executed)`);
     } else {
+      const rest = emitted.slice(gate.sentLen);
+      if (rest) streamText(rest);
       send({ id, object: "chat.completion.chunk", created, model, choices: [{ index: 0, delta: {}, finish_reason: finalReason }] });
     }
     res.write("data: [DONE]\n\n");
@@ -1180,24 +1200,52 @@ function extractShellBlock(text) {
   return cmd;
 }
 
-// Resuelve llamada a herramienta con 3 niveles (TRANSPORTE, no ejecución):
-// 1. EXEC::: explícito. 2. bloque shell -> exec_command (SOLO si el
-// cliente declaró exec_command; el cliente decide si ejecuta).
-// 3. reintento dirigido que pide SOLO el bloque.
-async function resolveToolCall(text, defs, wm, modelId, logTag) {
-  let tc = parseToolCall(text, defs);
-  if (tc) return tc;
+// Prior client-supplied calls, por transporte, para reusar ids estables
+// en turnos continuados. (Histórico: se leía body.tool_calls, campo que
+// no existe en los requests — los ids se regeneraban siempre.)
+function priorOpenAICalls(body) {
+  const out = [];
+  const msgs = (body && Array.isArray(body.messages) && body.messages) || [];
+  for (const m of msgs) {
+    if (m && m.role === "assistant" && Array.isArray(m.tool_calls)) {
+      const r = TOOLS_LIB.openAICallsToInternal(m.tool_calls);
+      if (r.ok) out.push(...r.calls);
+    }
+  }
+  return out;
+}
+
+function priorAnthropicCalls(body) {
+  const out = [];
+  const msgs = (body && Array.isArray(body.messages) && body.messages) || [];
+  for (const m of msgs) {
+    if (m && m.role === "assistant" && Array.isArray(m.content)) {
+      const r = TOOLS_LIB.anthropicBlocksToInternal(m.content);
+      if (r.ok) out.push(...r.calls);
+    }
+  }
+  return out;
+}
+
+// Resuelve llamadas a herramientas con 3 niveles (TRANSPORTE, no ejecución):
+// 1. parser polyglot multi-llamada (soporta tool use en paralelo). 2. bloque
+// shell -> exec_command (SOLO si el cliente declaró exec_command; el cliente
+// decide si ejecuta). 3. reintento dirigido, SOLO si el texto muestra
+// intención de tool (evita duplicar upstream en turnos conversacionales).
+async function resolveToolCalls(text, defs, wm, modelId, logTag) {
+  const parsed = TOOLS_LIB.parsePolyglotToolCalls(text, defs);
+  if (parsed.calls.length) {
+    return { calls: parsed.calls.map((c) => ({ name: c.name, args: JSON.stringify(c.args) })), prefixText: parsed.prefixText, matchIndex: parsed.matchIndex };
+  }
   const shellCmd = extractShellBlock(text);
   const execTool = (defs || []).find((t) => t.name === "exec_command");
   if (shellCmd && execTool) {
     const i = text.indexOf("```");
-    const toolName = execTool.name;
-    const args = { cmd: shellCmd };
     // Solo el NOMBRE de la tool en logs — nunca el comando (Phase 3).
-    trace(`${logTag} SHELL-BLOCK-TRANSPORT name=${toolName} (transport only, not executed)`);
-    return { name: toolName, args: JSON.stringify(args), prefixText: text.slice(0, i).trim() };
+    trace(`${logTag} SHELL-BLOCK-TRANSPORT name=${execTool.name} (transport only, not executed)`);
+    return { calls: [{ name: execTool.name, args: JSON.stringify({ cmd: shellCmd }) }], prefixText: text.slice(0, i).trim(), matchIndex: i };
   }
-  if (defs && defs.length && wm && modelId) {
+  if (defs && defs.length && wm && modelId && TOOLS_LIB.toolIntentHints(text)) {
     try {
       const names = defs.map((t) => t.name).slice(0, 8).join(", ");
       const strictMsgs = [
@@ -1206,17 +1254,70 @@ async function resolveToolCall(text, defs, wm, modelId, logTag) {
       ];
       trace(`${logTag} FC-RETRY tools=${names}`);
       const r2 = await fetchCompleteText({ messages: strictMsgs, modelId, thinking: false, deepSearch: false, signal: null, logTag: logTag + "/fc2" });
-      const tc2 = parseToolCall(r2.text, defs);
-      if (tc2) {
-        trace(`${logTag} FC-RETRY-OK name=${tc2.name}`);
-        return tc2;
+      const parsed2 = TOOLS_LIB.parsePolyglotToolCalls(r2.text, defs);
+      if (parsed2.calls.length) {
+        trace(`${logTag} FC-RETRY-OK n=${parsed2.calls.length} names=${parsed2.calls.map((c) => c.name).join(",")}`);
+        // matchIndex del TEXTO ORIGINAL (el retry vive en otro espacio de
+        // coordenadas): dónde empezó el intento de llamada en `text`.
+        return { calls: parsed2.calls.map((c) => ({ name: c.name, args: JSON.stringify(c.args) })), prefixText: parsed2.prefixText, matchIndex: TOOLS_LIB.firstToolMarkerIndex(text) };
       }
       trace(`${logTag} FC-RETRY-MISS chars=${r2.text.length}`);
     } catch (e) {
       trace(`${logTag} FC-RETRY-FAIL err=${e.message}`);
     }
   }
-  return null;
+  return { calls: [], prefixText: "", matchIndex: -1 };
+}
+
+// Compat legacy: primer llamado (nunca emite arrays).
+async function resolveToolCall(text, defs, wm, modelId, logTag) {
+  const res = await resolveToolCalls(text, defs, wm, modelId, logTag);
+  if (!res.calls.length) return null;
+  return { name: res.calls[0].name, args: res.calls[0].args, prefixText: res.prefixText };
+}
+
+// Streaming tool-marker gate (v2.3.3): los paths live SSE reenvían el texto
+// del worker en vivo, pero DEJAN de reenviar en cuanto empieza a formarse un
+// marcador de tool (EXEC:::, <tool_call>, <tool_use, <invoke, [tool_call,
+// [llamada a herramienta]) — así el razonamiento y la respuesta se ven en
+// vivo y el bloque de protocolo nunca se filtra como texto visible. La cola
+// de retención es inteligente (toolMarkerHoldback): en prosa normal es 0 y
+// el texto sale al instante; solo retiene una cola que todavía podría ser el
+// inicio de un marcador. Si al final del turno no se resuelve ninguna
+// llamada, el texto retenido se vuelca como texto normal: nada se pierde.
+function makeToolGate({ enabled, onText, logTag }) {
+  let sent = 0;
+  let gated = false;
+  return {
+    get sentLen() { return sent; },
+    get gated() { return gated; },
+    feed(emitted) {
+      if (!emitted) return;
+      if (!enabled) {
+        // Sin tools no hay conversión posible: emisión directa, nada se retiene.
+        const piece = emitted.slice(sent);
+        if (piece) { onText(piece); sent += piece.length; }
+        return;
+      }
+      if (gated) return;
+      const pending = emitted.slice(sent);
+      if (!pending) return;
+      const mi = TOOLS_LIB.firstToolMarkerIndex(pending);
+      if (mi >= 0) {
+        const safe = pending.slice(0, mi);
+        if (safe) onText(safe);
+        sent += safe.length;
+        gated = true;
+        trace(`${logTag} TOOL-GATE armed at=${sent} (protocol block held until turn end)`);
+        return;
+      }
+      // Holdback inteligente: en prosa normal es 0 (emisión inmediata);
+      // solo retiene una cola que todavía podría ser un marcador.
+      const hold = Math.min(TOOLS_LIB.toolMarkerHoldback(pending), pending.length);
+      const safe = pending.slice(0, pending.length - hold);
+      if (safe) { onText(safe); sent += safe.length; }
+    },
+  };
 }
 
 const toolDefsForWorker = TOOLS_LIB.toolDefsForWorker;
@@ -1271,9 +1372,10 @@ function platformInstruction(platform) {
   ].join("\n");
 }
 
-function agentSystemPrompt(tools, modelId, transport, platform) {
+function agentSystemPrompt(tools, modelId, transport, platform, opts) {
   const defs = toolDefsForWorker(tools);
   if (!defs.length) return "";
+  const o = opts || {};
   const isAnthropic = transport === "anthropic" || (typeof modelId === "string" && /claude/i.test(modelId));
   const plat = platform || "auto";
   const platText = platformInstruction(plat);
@@ -1289,11 +1391,16 @@ function agentSystemPrompt(tools, modelId, transport, platform) {
     "- Piensa y razona brevemente lo que vas a hacer y luego ejecuta la herramienta correspondiente.",
     `CATÁLOGO AUTORIZADO DE HERRAMIENTAS: [${toolNames}].`,
     "PROHIBIDO INVENTAR HERRAMIENTAS: Únicamente puedes invocar herramientas que existan en este catálogo.",
+    "LLAMADAS EN PARALELO: Si varias herramientas no dependen entre sí, puedes emitir varias llamadas en la misma respuesta (una después de la otra).",
     platText,
   ];
+  if (o.requireTool) commonGrounding.push("OBLIGATORIO EN ESTA RESPUESTA: debes invocar al menos una herramienta del catálogo (el cliente lo exige).");
+  if (o.forcedToolName) commonGrounding.push(`OBLIGATORIO EN ESTA RESPUESTA: invoca exactamente la herramienta ${o.forcedToolName} (elección forzada por el cliente).`);
 
   if (isAnthropic) {
-    const lines = defs.map((d) => `- <tool_description>\n<name>${d.name}</name>\n<description>${d.description}</description>\n<parameters>${JSON.stringify(d.params)}</parameters>\n</tool_description>`);
+    const lines = defs.map((d) => d.schemaOmitted
+      ? `- <tool_description>\n<name>${d.name}</name>\n<description>${d.description}</description>\n</tool_description>`
+      : `- <tool_description>\n<name>${d.name}</name>\n<description>${d.description}</description>\n<parameters>${JSON.stringify(d.params)}</parameters>\n</tool_description>`);
     return [
       ...commonGrounding,
       "FORMATO DE LLAMADA: Para invocar una herramienta, emite las etiquetas XML estándar:",
@@ -1311,7 +1418,9 @@ function agentSystemPrompt(tools, modelId, transport, platform) {
     ].join("\n");
   }
 
-  const lines = defs.map((d) => `- ${d.name}: ${d.description} params=${JSON.stringify(d.params).slice(0, 800)}`);
+  const lines = defs.map((d) => d.schemaOmitted
+    ? `- ${d.name}: ${d.description}`
+    : `- ${d.name}: ${d.description} params=${JSON.stringify(d.params).slice(0, 800)}`);
   return [
     ...commonGrounding,
     "FORMATO DE LLAMADA: Cuando decidas invocar una herramienta, emite la llamada en formato <tool_call> o bloque JSON:",
@@ -1496,23 +1605,24 @@ async function handleResponses(req, res, body, requestId) {
   const rspStatus = rspCap.hit ? "incomplete" : status;
   const outputTokens = estTokens(result.text);
   // Puente agéntico centralizado (EXEC -> shell-block -> reintento).
-  const toolCall = fnTools.length ? await resolveToolCall(result.text, fnTools, workerMessages, model, logTag) : null;
-  if (toolCall) trace(`${logTag} TOOL-TRANSPORT name=${toolCall.name} (transport only, not executed)`);
+  const rtcResp = fnTools.length ? await resolveToolCalls(result.text, fnTools, workerMessages, model, logTag) : { calls: [], prefixText: "" };
+  if (rtcResp.calls.length) trace(`${logTag} TOOL-TRANSPORT n=${rtcResp.calls.length} names=${rtcResp.calls.map((c) => c.name).join(",")} (transport only, not executed)`);
   let outputItems;
   let fcItem = null;
-  if (toolCall) {
-    const msgPart = toolCall.prefixText
-      ? [{ type: "output_text", text: toolCall.prefixText, annotations: [] }]
+  if (rtcResp.calls.length) {
+    const msgPart = rtcResp.prefixText
+      ? [{ type: "output_text", text: rtcResp.prefixText, annotations: [] }]
       : [];
     const msgItem = {
       type: "message", id: "msg_" + rid(), status: "completed",
       role: "assistant", content: msgPart,
     };
-    fcItem = {
+    const fcItems = rtcResp.calls.map((c) => ({
       type: "function_call", id: "fc_" + rid(), call_id: "call_" + rid().slice(0, 20),
-      status: "completed", name: toolCall.name, arguments: toolCall.args,
-    };
-    outputItems = msgPart.length ? [msgItem, fcItem] : [fcItem];
+      status: "completed", name: c.name, arguments: c.args,
+    }));
+    fcItem = fcItems[0];
+    outputItems = msgPart.length ? [msgItem, ...fcItems] : fcItems;
   } else {
     outputItems = [{
       type: "message", id: "msg_" + rid(), status: rspStatus === "completed" ? "completed" : "incomplete",
@@ -1577,7 +1687,7 @@ async function handleResponses(req, res, body, requestId) {
     usage[body.__tier].tokens += estTokens(result.text);
   stopHeartbeat();
   recordLatency(ROUTE, Date.now() - T0);
-  trace(`${logTag} SERVED-FC name=${fcItem.name} elapsed=${Date.now() - t0}ms`);
+  trace(`${logTag} SERVED-FC n=${rtcResp.calls.length} names=${rtcResp.calls.map((c) => c.name).join(",")} elapsed=${Date.now() - t0}ms`);
   try { body.__release(); } catch {}
     return res.end();
   }
@@ -1674,8 +1784,12 @@ async function handleMessages(req, res, body, requestId) {
   if (!workerMessages.length) { release(); stats.errors++; return anthropicError(res, 400, "messages required", req); }
   const stream = body.stream === true;
   // Thinking Anthropic -> flag del worker. El worker razona en el texto;
-  // FMP no fabrica bloques thinking (ver /health.thinking).
-  const thinking = body.thinking !== undefined ? !!body.thinking : true;
+  // FMP no fabrica bloques thinking (ver /health.thinking). Acepta el
+  // objeto nativo {type:"enabled"|"disabled"} (los clients modernos mandan
+  // {type:"disabled"} para APAGARLO: antes se interpretaba como encendido).
+  const thinking = body.thinking !== undefined
+    ? (body.thinking !== null && typeof body.thinking === "object" ? body.thinking.type !== "disabled" : !!body.thinking)
+    : true;
 
   const msgId = "msg_" + rid();
   const inputTokens = estTokens(JSON.stringify(workerMessages));
@@ -1690,14 +1804,24 @@ async function handleMessages(req, res, body, requestId) {
   const antTools = Array.isArray(body.tools) ? body.tools : [];
   const antChoice = body.tool_choice;
   const antDisabled = antChoice && (antChoice.type === "none" || antChoice === "none");
-  const antToolSys = (antDefs.length && !antDisabled) ? agentSystemPrompt(antTools, model, "anthropic", platform) : "";
+  let antForced = null;
+  let antRequired = false;
+  if (antChoice && typeof antChoice === "object") {
+    if (antChoice.type === "tool" && typeof antChoice.name === "string") antForced = antChoice.name;
+    if (antChoice.type === "any") antRequired = true;
+  }
+  if (antForced && !antDefs.some((d) => d.name === antForced)) antForced = null;
+  const antToolSys = (antDefs.length && !antDisabled) ? agentSystemPrompt(antTools, model, "anthropic", platform, { forcedToolName: antForced, requireTool: antRequired }) : "";
   const combinedAntSys = [antToolSys, body.system].filter(Boolean);
   const wmAnt = toWorkerMessagesAnt(combinedAntSys, body.messages);
 
   const t0 = Date.now();
   trace(`${logTag} START-LIVE stream=${stream} tools=${antDefs.length} thinking=${thinking}`);
-    const hasTools = antDefs.length && !antDisabled;
-  const fullMode = body.stream_mode === "full" || (hasTools && stream);
+  const hasTools = antDefs.length && !antDisabled;
+  // Con tools el default ahora es LIVE + gate de marcador (v2.3.3): el
+  // texto (incluido el razonamiento) se ve en vivo y el bloque de
+  // protocolo se retiene hasta resolver la llamada al final del turno.
+  const fullMode = body.stream_mode === "full";
   if (fullMode && stream) {
     res.writeHead(200, sseHeaders(req));
     const stopHeartbeat = startHeartbeat(res, req, logTag);
@@ -1730,9 +1854,9 @@ async function handleMessages(req, res, body, requestId) {
     const ftext = capped.hit ? capped.text : got;
     usage[tier].tokens += estTokens(ftext);
 
-    const tc0 = hasTools ? await resolveToolCall(ftext, antDefs, wmAnt, model, logTag) : null;
+    const tc0 = hasTools ? await resolveToolCalls(ftext, antDefs, wmAnt, model, logTag) : { calls: [], prefixText: "" };
 
-    if (tc0) {
+    if (tc0.calls.length) {
       let blockIdx = 0;
       if (tc0.prefixText) {
         fsend(fev("content_block_start", { type: "content_block_start", index: blockIdx, content_block: { type: "text", text: "" } }));
@@ -1743,13 +1867,17 @@ async function handleMessages(req, res, body, requestId) {
         fsend(fev("content_block_stop", { type: "content_block_stop", index: blockIdx }));
         blockIdx++;
       }
-      const tuId = "toolu_" + rid().slice(0, 20);
-      fsend(fev("content_block_start", { type: "content_block_start", index: blockIdx, content_block: { type: "tool_use", id: tuId, name: tc0.name, input: {} } }));
-      fsend(fev("content_block_delta", { type: "content_block_delta", index: blockIdx, delta: { type: "input_json_delta", partial_json: tc0.args } }));
-      fsend(fev("content_block_stop", { type: "content_block_stop", index: blockIdx }));
+      const priorAnt = priorAnthropicCalls(body);
+      for (const c of tc0.calls) {
+        const tuId = TOOLS_LIB.findPriorCallId(priorAnt, c.name) || ("toolu_" + rid().slice(0, 20));
+        fsend(fev("content_block_start", { type: "content_block_start", index: blockIdx, content_block: { type: "tool_use", id: tuId, name: c.name, input: {} } }));
+        fsend(fev("content_block_delta", { type: "content_block_delta", index: blockIdx, delta: { type: "input_json_delta", partial_json: c.args } }));
+        fsend(fev("content_block_stop", { type: "content_block_stop", index: blockIdx }));
+        blockIdx++;
+      }
       fsend(fev("message_delta", { type: "message_delta", delta: { stop_reason: "tool_use", stop_sequence: null }, usage: { output_tokens: estTokens(ftext) } }));
       fsend(fev("message_stop", { type: "message_stop" }));
-      trace(`${logTag} SERVED-TOOL-STREAM name=${tc0.name} elapsed=${Date.now() - t0}ms`);
+      trace(`${logTag} SERVED-TOOL-STREAM n=${tc0.calls.length} names=${tc0.calls.map((c) => c.name).join(",")} elapsed=${Date.now() - t0}ms`);
     } else {
       const fstop = capped.hit ? "max_tokens" : "end_turn";
       fsend(fev("content_block_start", { type: "content_block_start", index: 0, content_block: { type: "text", text: "" } }));
@@ -1787,18 +1915,26 @@ async function handleMessages(req, res, body, requestId) {
     const cappedAnt = applyMaxTokens(got, maxTokens);
     if (cappedAnt.hit) trace(`${logTag} MAXTOKENS cut=${got.length}->${cappedAnt.text.length}`);
     got = cappedAnt.hit ? cappedAnt.text : got;
-    const tc0 = antDefs.length && !antDisabled ? await resolveToolCall(got, antDefs, wmAnt, model, logTag) : null;
+    const rtcA = antDefs.length && !antDisabled ? await resolveToolCalls(got, antDefs, wmAnt, model, logTag) : { calls: [], prefixText: "" };
     let content0;
     let stop0 = cappedAnt.hit ? "max_tokens" : "end_turn";
-    if (tc0) {
-      let input = {};
-      try { input = JSON.parse(tc0.args); } catch { input = {}; }
+    if (rtcA.calls.length) {
       content0 = [];
-      if (tc0.prefixText) content0.push({ type: "text", text: tc0.prefixText });
-      content0.push({ type: "tool_use", id: "toolu_" + rid().slice(0, 20), name: tc0.name, input });
+      if (rtcA.prefixText) content0.push({ type: "text", text: rtcA.prefixText });
+      const priorAnt = priorAnthropicCalls(body);
+      for (const c of rtcA.calls) {
+        let input = {};
+        try { input = JSON.parse(c.args); } catch { input = {}; }
+        content0.push({
+          type: "tool_use",
+          id: TOOLS_LIB.findPriorCallId(priorAnt, c.name) || ("toolu_" + rid().slice(0, 20)),
+          name: c.name,
+          input,
+        });
+      }
       stop0 = "tool_use";
-      // Solo nombre de tool en logs — nunca argumentos (Phase 3).
-      trace(`${logTag} TOOL-TRANSPORT name=${tc0.name} (transport only, not executed)`);
+      // Solo nombres de tools en logs — nunca argumentos (Phase 3).
+      trace(`${logTag} TOOL-TRANSPORT n=${rtcA.calls.length} names=${rtcA.calls.map((c) => c.name).join(",")} (transport only, not executed)`);
     } else {
       content0 = [{ type: "text", text: got }];
     }
@@ -1839,6 +1975,17 @@ async function handleMessages(req, res, body, requestId) {
   const maxChars = Math.floor(maxTokens * 4);
   const ctrl = new AbortController();
   req.on("close", () => { try { ctrl.abort(); } catch {} });
+  const streamAntText = (piece) => {
+    if (!piece || closed) return;
+    const CH = 48;
+    for (let k = 0; k < piece.length && !closed; k += CH) {
+      send(ev("content_block_delta", { type: "content_block_delta", index: 0, delta: { type: "text_delta", text: piece.slice(k, k + CH) } }));
+    }
+  };
+  // Gate de marcador (v2.3.3), idéntico al path OAI: el texto fluye en
+  // vivo hasta que empieza un marcador de tool; lo retenido se resuelve
+  // (o se vuelca como texto) al final del turno.
+  const gate = makeToolGate({ enabled: hasTools, onText: streamAntText, logTag });
   const emitAnt = (novel) => {
     if (!novel || closed) return;
     let piece = novel;
@@ -1848,7 +1995,7 @@ async function handleMessages(req, res, body, requestId) {
     }
     if (piece) {
       emitted += piece;
-      send(ev("content_block_delta", { type: "content_block_delta", index: 0, delta: { type: "text_delta", text: piece } }));
+      gate.feed(emitted);
     }
     if (cappedHit) { try { ctrl.abort(); } catch {} }
   };
@@ -1946,10 +2093,7 @@ async function handleMessages(req, res, body, requestId) {
         }
         if (novel && !closed) {
           if (cappedHit) break;
-          emitted += novel;
-          for (let k = 0; k < novel.length; k += 48) {
-            send(ev("content_block_delta", { type: "content_block_delta", index: 0, delta: { type: "text_delta", text: novel.slice(k, k + 48) } }));
-          }
+          emitAnt(novel);
         }
         if (cont.done) {
           complete = !cappedHit;
@@ -1981,20 +2125,30 @@ async function handleMessages(req, res, body, requestId) {
   if (!closed) {
     // Sin rescate por continuación (ver nota OAI): cierre honesto.
     // Cap de max_tokens -> max_tokens (como API nativa).
-    let antFinal = cappedHit ? "max_tokens" : (complete ? "end_turn" : "max_tokens");
-    // Puente tool-use post-stream: solo si el worker emitió EXEC explícito.
-    let tcLive = antDefs.length && !antDisabled ? parseToolCall(emitted, antDefs) : null;
-    if (tcLive) {
-      let input = {};
-      try { input = JSON.parse(tcLive.args); } catch { input = {}; }
-      const tuId = "toolu_" + rid().slice(0, 20);
+    const antFinal = cappedHit ? "max_tokens" : (complete ? "end_turn" : "max_tokens");
+    // Resolución TRANSPORTE al final del turno (multi-llamada + shell +
+    // FC-RETRY gateado por intención), igual que OAI. El texto retenido
+    // por el gate hasta el marcador se vuelca primero como text_delta.
+    const rtcLive = hasTools ? await resolveToolCalls(emitted, antDefs, wmAnt, model, logTag) : { calls: [], prefixText: "", matchIndex: -1 };
+    if (rtcLive.calls.length) {
+      const prefixEnd = (typeof rtcLive.matchIndex === "number" && rtcLive.matchIndex >= 0) ? rtcLive.matchIndex : emitted.length;
+      const rest = emitted.slice(gate.sentLen, prefixEnd).replace(/`{3}(?:json|xml|bash|sh|zsh)?\s*$/i, "");
+      if (rest.trim()) streamAntText(rest);
       send(ev("content_block_stop", { type: "content_block_stop", index: 0 }));
-      send(ev("content_block_start", { type: "content_block_start", index: 1, content_block: { type: "tool_use", id: tuId, name: tcLive.name, input: {} } }));
-      send(ev("content_block_delta", { type: "content_block_delta", index: 1, delta: { type: "input_json_delta", partial_json: JSON.stringify(input) } }));
-      send(ev("content_block_stop", { type: "content_block_stop", index: 1 }));
+      const priorAnt = priorAnthropicCalls(body);
+      let blockIdx = 1;
+      for (const c of rtcLive.calls) {
+        const tuId = TOOLS_LIB.findPriorCallId(priorAnt, c.name) || ("toolu_" + rid().slice(0, 20));
+        send(ev("content_block_start", { type: "content_block_start", index: blockIdx, content_block: { type: "tool_use", id: tuId, name: c.name, input: {} } }));
+        send(ev("content_block_delta", { type: "content_block_delta", index: blockIdx, delta: { type: "input_json_delta", partial_json: c.args } }));
+        send(ev("content_block_stop", { type: "content_block_stop", index: blockIdx }));
+        blockIdx++;
+      }
       send(ev("message_delta", { type: "message_delta", delta: { stop_reason: "tool_use", stop_sequence: null }, usage: { output_tokens: estTokens(emitted) } }));
-      trace(`${logTag} LIVE TOOL-TRANSPORT name=${tcLive.name} (transport only, not executed)`);
+      trace(`${logTag} LIVE TOOL-TRANSPORT n=${rtcLive.calls.length} names=${rtcLive.calls.map((c) => c.name).join(",")} (transport only, not executed)`);
     } else {
+      const rest = emitted.slice(gate.sentLen);
+      if (rest) streamAntText(rest);
       send(ev("content_block_stop", { type: "content_block_stop", index: 0 }));
       send(ev("message_delta", { type: "message_delta", delta: { stop_reason: antFinal, stop_sequence: null }, usage: { output_tokens: estTokens(emitted) } }));
     }

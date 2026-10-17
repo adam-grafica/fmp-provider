@@ -77,15 +77,44 @@ test("unit: unknown EXEC tool rejected (no phantom calls)", () => {
   assert.equal(hit, null);
 });
 
-test("unit: 30+ tools accepted for transport, worker catalog capped", () => {
-  const many = Array.from({ length: 40 }, (_, i) => ({ type: "function", function: { name: "tool_" + i } }));
+test("unit: 30+ tools accepted for transport, worker catalog keeps all names", () => {
+  const many = Array.from({ length: 40 }, (_, i) => ({ type: "function", function: { name: "tool_" + i, description: "d" + i, parameters: { type: "object", properties: { a: { type: "string" }, b: { type: "string" } } } } }));
   const v = T.validateOpenAITools(many);
   assert.equal(v.ok, true);
   assert.equal(v.defs.length, 40);
   const bridged = T.toolDefsForWorker(many);
-  assert.equal(bridged.length, T.MAX_WORKER_TOOLS);
+  assert.equal(bridged.length, 40);
+  assert.deepEqual(bridged.map((d) => d.name), many.map((t) => t.function.name));
+  assert.equal(bridged[39].schemaOmitted, false);
+  const tight = T.toolDefsForWorker(many, 200);
+  assert.equal(tight.length, 40);
+  assert.ok(tight[39].schemaOmitted === true);
+  assert.equal(tight[39].params && Object.keys(tight[39].params).length, 0);
   const tooMany = Array.from({ length: 200 }, (_, i) => ({ type: "function", function: { name: "t" + i } }));
   assert.equal(T.validateOpenAITools(tooMany).ok, false);
+});
+
+test("unit: multi-call parser collects parallel tool calls", () => {
+  const defs = [{ name: "get_weather" }, { name: "get_time" }];
+  const text = "Voy a consultar ambas.\n<tool_call>\n{\"name\": \"get_weather\", \"arguments\": {\"city\": \"BA\"}}\n</tool_call>\n<tool_call>\n{\"name\": \"get_time\", \"arguments\": {\"tz\": \"UTC\"}}\n</tool_call>";
+  const res = T.parsePolyglotToolCalls(text, defs);
+  assert.equal(res.calls.length, 2);
+  assert.equal(res.calls[0].name, "get_weather");
+  assert.equal(res.calls[1].name, "get_time");
+  assert.equal(res.calls[1].args.tz, "UTC");
+  assert.equal(res.prefixText, "Voy a consultar ambas.");
+  const single = T.parsePolyglotToolCall(text, defs);
+  assert.equal(single.name, "get_weather");
+});
+
+test("unit: multi-call parser handles mixed EXEC blocks", () => {
+  const defs = [{ name: "Read" }, { name: "Bash" }];
+  const text = "ok\nEXEC:::Read ARGS {\"path\": \"a.txt\"}\nEXEC:::Bash ARGS {\"cmd\": \"ls\"}";
+  const res = T.parsePolyglotToolCalls(text, defs);
+  assert.equal(res.calls.length, 2);
+  assert.equal(res.calls[0].name, "Read");
+  assert.equal(res.calls[1].name, "Bash");
+  assert.equal(res.calls[1].args.cmd, "ls");
 });
 
 test("unit: invalid JSON args rejected", () => {
@@ -230,4 +259,37 @@ test("unit: polyglot tool parser rejects hallucinated phantom tools", () => {
   const text = "simulando:\n<tool_call>{\"name\": \"file_edit\", \"arguments\": {\"file\": \"a.txt\"}}\n</tool_call>";
   const hit = T.parsePolyglotToolCall(text, [{ name: "terminal" }, { name: "calc" }]);
   assert.equal(hit, null, "phantom tools must be rejected");
+});
+
+test("unit: streaming gate - firstToolMarkerIndex finds earliest marker", () => {
+  assert.equal(T.firstToolMarkerIndex("prosa normal sin nada"), -1);
+  assert.equal(T.firstToolMarkerIndex("hola\nEXEC:::tool ARGS {}"), 5);
+  assert.equal(T.firstToolMarkerIndex("bla <tool_call>{...}"), 4);
+  assert.equal(T.firstToolMarkerIndex("x [llamada a herramienta: t]"), 2);
+});
+
+test("unit: streaming gate - toolMarkerHoldback is 0 in normal prose", () => {
+  assert.equal(T.toolMarkerHoldback("hola mundo, todo tranquilo"), 0);
+  assert.equal(T.toolMarkerHoldback("a < b y c > d"), 0);
+  // 1 char max: una "e" final puede ser el inicio de EXEC (delay <= 1 char).
+  assert.equal(T.toolMarkerHoldback("texto que termina en e"), 1);
+  assert.equal(T.toolMarkerHoldback("linea termina en exec"), 4);
+});
+
+test("unit: streaming gate - toolMarkerHoldback holds only marker prefixes", () => {
+  assert.equal(T.toolMarkerHoldback("respuesta hasta <tool_ca"), 8);
+  assert.equal(T.toolMarkerHoldback("respuesta <tool_call"), 10);
+  assert.equal(T.toolMarkerHoldback("ver EXEC"), 4);
+  assert.equal(T.toolMarkerHoldback("ver EXEC "), 5);
+  assert.equal(T.toolMarkerHoldback("mirar [llam"), 5);
+  assert.equal(T.toolMarkerHoldback("usa <inv"), 4);
+});
+
+test("unit: streaming gate - markerIndex of multi parse is first call position", () => {
+  const defs = [{ name: "calc" }, { name: "terminal" }];
+  const text = "intro\nEXEC:::calc ARGS {\"val\":1}\nEXEC:::terminal ARGS {\"command\":\"pwd\"}";
+  const r = T.parsePolyglotToolCalls(text, defs);
+  assert.equal(r.calls.length, 2);
+  assert.equal(r.matchIndex, 5);
+  assert.equal(text.slice(0, r.matchIndex).trim(), "intro");
 });

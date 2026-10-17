@@ -1,5 +1,61 @@
 # FMP Changelog
 
+## v2.3.3 — LIVE STREAMING WITH TOOLS & ANTHROPIC THINKING FLAG (2026-10-17)
+
+Professional-chat UX for tool turns: the client sees the answer (and the
+model's reasoning) streaming live while tools are active, and protocol
+blocks never leak as visible text.
+
+- **Live + tool gate**: `stream=true` with tools no longer forces full
+  buffering (`stream_mode:"full"` remains the explicit opt-in). Both live
+  SSE paths (OpenAI and Anthropic) stream text as it arrives and a
+  marker gate (`makeToolGate`, `firstToolMarkerIndex`, `toolMarkerHoldback`)
+  stops forwarding the moment a tool marker starts forming
+  (`EXEC:::`/`<tool_call>`/`<tool_use`/`<invoke>`/`[tool_call`/
+  `[llamada a herramienta`). The holdback is smart: 0 chars in normal
+  prose (instant emission, bridge adds no visible latency) and only the
+  tail that could still grow into a marker is withheld (ceiling
+  `GATE_HOLDBACK=24`). At turn end the held text is flushed as normal
+  text if no call resolves — nothing is ever lost.
+- **Multi-call at the live end**: end-of-stream bridges now use
+  `resolveToolCalls` (parallel calls + shell + FC-RETRY), emitting N
+  `tool_calls` (OpenAI) / N `tool_use` blocks with real ids reused from
+  prior turns (Anthropic) instead of a single call.
+- **`matchIndex`** added to the polyglot parser (single + multi) so the
+  gate can flush exactly the text before the first marker; `resolveToolCalls`
+  propagates it (FC-RETRY uses the ORIGINAL text coordinates).
+- **Anthropic `thinking` flag**: native `{type:"enabled"|"disabled"}`
+  objects are honored — `{type:"disabled"}` no longer reads as truthy
+  (which silently kept reasoning on for clients asking it off).
+
+Known trade-off: the bare-JSON fallback (a model emitting a complete
+`{"name":...,"arguments":...}` object without any marker) streams that
+JSON live before it is transported as a call; the marker protocols
+(EXEC/XML tags) never leak.
+
+## v2.3.2 — PARALLEL TOOL CALLS & FULL WORKER CATALOG (2026-10-17)
+
+Fixed the two production bugs behind "algunas tools se caen" (tools silently dropped):
+
+- **Parallel tool calls**: `parsePolyglotToolCalls` collects EVERY call in a response
+  (multiple `<tool_call>`/`<tool_use>`/`<invoke>`/EXEC blocks, mixed formats included);
+  OpenAI emits N `tool_calls`, Anthropic N `tool_use` blocks, Responses N `function_call`
+  items — each with its own id. Previously only the first call was transported and the
+  rest vanished silently.
+- **Full worker catalog**: every declared tool NAME is now always visible to the worker
+  (previously hard-capped at 25). Full JSON schemas fill a 20k-char budget; the rest ship
+  compact (name + description) instead of disappearing — tools #26+ are callable again
+  (OpenCode/Codex send 30–60+ schemas).
+- **Stable tool ids across turns**: prior calls are read from `messages` (assistant
+  `tool_calls` / `tool_use` blocks) instead of the nonexistent `body.tool_calls`; retried
+  or continued turns reuse the original ids instead of minting new ones.
+- **FC-RETRY gating**: the directed retry only fires when the text shows real tool intent,
+  saving a full extra upstream call on every conversational turn with tools active.
+- **tool_choice**: `required` and forced-tool selections are now explained to the worker
+  (OpenAI `{type:"function"}` and Anthropic `{type:"tool",name}` / `{type:"any"}`);
+  Anthropic tool results flagged `is_error` now reach the worker marked `(ERROR)`.
+- Tool names may now contain `:` (e.g. `mcp:tool`); test suite expanded to 51 tests.
+
 ## v2.3.1 — PRODUCTION AGENTIC TOOL HARDENING & 9ROUTER REFINEMENT (2026-10-15)
 
 Production readiness hardening for agentic tool calls across OpenAI and Anthropic routes,
